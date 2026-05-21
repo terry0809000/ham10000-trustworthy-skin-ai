@@ -1,0 +1,35 @@
+# Data and model artifacts
+/data/raw/*
+/data/processed/*
+/data/external/*
+!/data/raw/.gitkeep
+!/data/processed/.gitkeep
+!/data/external/.gitkeep
+/models/*
+!/models/.gitkeep
+/results/*
+!/results/.gitkeep
+/figures/*
+!/figures/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.ipynb_checkpoints/
+.pytest_cache/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Large image/model outputs
+*.keras
+*.h5
+*.tflite
+*.ckpt
+*.zip
+*.tar
+*.gz

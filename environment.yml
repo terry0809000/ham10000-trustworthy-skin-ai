@@ -1,0 +1,20 @@
+name: ham10000-trustworthy-ai
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - pillow
+  - pyyaml
+  - tqdm
+  - scipy
+  - joblib
+  - pip
+  - pip:
+      - tensorflow-cpu>=2.16
+      - nbformat>=5.9
+      - jupyter>=1.0
+      - pytest>=7.4
