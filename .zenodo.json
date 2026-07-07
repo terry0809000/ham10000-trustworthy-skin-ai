@@ -1,7 +1,7 @@
 {
   "title": "Calibrated Selective Referral for Skin Lesion AI on HAM10000",
   "upload_type": "software",
-  "description": "Reviewer-patched V4 reproducibility package for a leakage-controlled, calibrated, selective-referral HAM10000 skin-lesion AI workflow. The repository includes the authoritative Colab notebook, an auto-extracted audit script, reusable Python helpers, configuration files, lightweight tests, and publication-readiness documentation. Raw HAM10000/ISIC images, generated results, trained models, and deployment artifacts are intentionally excluded.",
+  "description": "Final notebook reproducibility package for a leakage-controlled, calibrated, selective-referral HAM10000 skin-lesion AI workflow. The repository includes the authoritative Colab notebook, an auto-extracted audit script, reusable Python helpers, configuration files, lightweight tests, and publication-readiness documentation. Raw HAM10000/ISIC images, generated results, trained models, and deployment artifacts are intentionally excluded.",
   "creators": [
     {
       "name": "Yu, Tianyi"

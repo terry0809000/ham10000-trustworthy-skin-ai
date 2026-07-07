@@ -2,7 +2,7 @@
 
 A leakage-controlled, calibrated, selective-referral evaluation workflow for HAM10000 skin-lesion AI.
 
-This repository packages the reviewer-patched V4 Colab workflow and reusable Python helpers for the study:
+This repository packages the final notebook Colab workflow and reusable Python helpers for the study:
 
 > **Calibrated Selective Referral for Skin Lesion AI on HAM10000**
 

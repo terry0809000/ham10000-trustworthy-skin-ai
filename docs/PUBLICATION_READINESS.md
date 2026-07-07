@@ -1,6 +1,6 @@
 # Publication Readiness
 
-This repository is prepared as a public, code-availability package for the V4 reviewer-patched notebook.
+This repository is prepared as a public, code-availability package for the final notebook.
 
 ## Included
 
