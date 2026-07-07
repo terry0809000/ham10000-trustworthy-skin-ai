@@ -1,24 +1,104 @@
-project_name: ham10000_trustworthy_skin_ai
-seed: 42
-image_size: 224
-batch_size: 8
-backbone: ResNet50
-loss_type: weighted_ce
-use_metadata: false
-head_epochs: 8
-finetune_epochs: 20
-finetune_last_n_layers: 40
-dropout_rate: 0.30
-head_learning_rate: 0.001
-finetune_learning_rate: 0.00001
-early_stopping_patience: 5
-focal_gamma: 2.0
-class_balanced_beta: 0.9999
-n_bins_ece: 15
-bootstrap_reps: 1000
-min_subgroup_n: 30
-mc_dropout_passes: 20
-class_names: [akiec, bcc, bkl, df, mel, nv, vasc]
+project_name: trustworthy_skin_lesion_ai_ham10000_cpu_full
+
+data_acquisition:
+  mount_google_drive: true
+  google_drive_mount_points:
+    - /content/drive
+    - /content/gdrive
+  use_google_drive_for_work_dir: true
+  google_drive_work_dir_name: ham10000_trustworthy_ai
+  local_fallback_work_dir: /content/ham10000_trustworthy_ai
+  drive_zip_path: /content/drive/MyDrive/dataverse_files.zip
+  download_ham10000_dataverse_if_missing: true
+  ham10000_dataverse_server: https://dataverse.harvard.edu
+  ham10000_dataverse_persistent_id: doi:10.7910/DVN/DBW86T
+  ham10000_dataverse_download_filename: dataverse_files.zip
+  allow_extracted_ham10000_without_zip: true
+  compute_data_zip_md5: false
+  ham10000_recursive_drive_zip_search: true
+
+reproducibility:
+  seed: 42
+  final_seeds: [42, 2026, 3407]
+  run_final_three_seeds: true
+  force_retrain: true
+  main_model_selection_image_only: true
+  include_multimodal_in_model_selection: false
+  run_final_selected_seed_confirmation: true
+
+split:
+  test_size: 0.20
+  val_size_of_trainval: 0.20
+  split_by: lesion_id
+  label_col: dx
+  image_id_col: image_id
+
+model:
+  image_size: 224
+  batch_size: 8
+  preview_tfdata_batch: false
+  data_pipeline_backend: keras_sequence_cpu
+  force_cpu_training: true
+  force_gpu_training: false
+  build_model_on_cpu: true
+  compile_model_on_cpu: true
+  run_model_build_preview: false
+  backbone: EfficientNetB0
+  use_metadata: false
+  dropout_rate: 0.30
+  head_epochs: 8
+  finetune_epochs: 20
+  finetune_last_n_layers: 40
+  head_learning_rate: 0.001
+  finetune_learning_rate: 0.00001
+  early_stopping_patience: 5
+  class_names: [akiec, bcc, bkl, df, mel, nv, vasc]
+
+imbalance:
+  loss_type: weighted_ce
+  focal_gamma: 2.0
+  class_balanced_beta: 0.9999
+  run_model_funnel: true
+  funnel_backbones: [EfficientNetB0, MobileNetV2, ResNet50]
+  run_long_tail_ablation: true
+  long_tail_losses: [weighted_ce, focal, class_balanced_ce]
+  run_multimodal_ablation: true
+
+evaluation:
+  n_bins_ece: 15
+  bootstrap_reps: 1000
+  run_bootstrap: true
+  min_subgroup_n: 30
+  calibration_bootstrap_reps: 1000
+  ece_acceptability_note: No universal clinical ECE threshold is assumed. ECE <= 0.05 is treated only as an exploratory desirable calibration target, not as deployment clearance.
+
+selective_referral:
+  primary_uncertainty_score: entropy
+  referral_target_selective_risk: 0.15
+  referral_minimum_validation_coverage: 0.50
+  referral_threshold_selection_rule: maximum validation coverage with selective risk <= target risk; if none, report minimum observed validation risk
+
+uncertainty:
+  run_mc_dropout: true
+  mc_dropout_passes: 20
+  mc_dropout_max_n: 500
+
+related_domain_and_stress:
+  download_isic2018_task3_test_if_missing: true
+  isic2018_download_dir: /content/ISIC2018
+  run_isic2018_related_domain_if_found: true
+  run_isic2018_external_if_found: true
+  near_duplicate_dhash_threshold: 5
+  run_stress_tests: true
+  stress_test_max_images: 1000
+  run_gradcam_example: true
+
+deployment:
+  run_tflite_export: true
+  tflite_profile_max_n: 200
+  tflite_performance_max_n:
+  generate_reviewer_compliance_matrix: true
+
 paths:
   raw_dir: data/raw
   processed_dir: data/processed

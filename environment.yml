@@ -12,6 +12,7 @@ dependencies:
   - tqdm
   - scipy
   - joblib
+  - psutil
   - pip
   - pip:
       - tensorflow-cpu>=2.16

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 import yaml
@@ -53,9 +53,29 @@ class Config:
         return {name: idx for idx, name in enumerate(self.class_names)}
 
 
+def _normalise_config_data(data: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Support both the original flat YAML and the grouped V4 notebook config."""
+    raw = dict(data or {})
+    paths = raw.get("paths", {})
+    flat: dict[str, Any] = {}
+
+    for key, value in raw.items():
+        if key == "paths" or isinstance(value, dict):
+            continue
+        flat[key] = value
+
+    for value in raw.values():
+        if isinstance(value, dict):
+            flat.update(value)
+
+    allowed = {item.name for item in fields(Config)} - {"paths"}
+    return {key: value for key, value in flat.items() if key in allowed}, paths
+
+
 def load_config(path: str | Path = "configs/default.yaml") -> Config:
     data = yaml.safe_load(Path(path).read_text())
-    paths = ProjectPaths.from_dict(data.pop("paths", {}))
-    cfg = Config(**data, paths=paths)
+    cfg_data, paths_data = _normalise_config_data(data)
+    paths = ProjectPaths.from_dict(paths_data)
+    cfg = Config(**cfg_data, paths=paths)
     cfg.paths.make_dirs()
     return cfg

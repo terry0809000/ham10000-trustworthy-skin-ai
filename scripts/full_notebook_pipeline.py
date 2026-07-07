@@ -142,11 +142,28 @@ print("Logical GPUs visible to TensorFlow:", tf.config.list_logical_devices("GPU
 print("Physical CPUs:", tf.config.list_physical_devices("CPU"))
 
 # %% [cell 4]
+# --- Configuration, safe Google Drive mount, and output directories ---
+# V4 fix: mount Drive before creating any /content/drive subdirectories. Earlier versions
+# created /content/drive/MyDrive/... before drive.mount(), which can trigger Colab's
+# "Mountpoint must not already contain files" error.
+
 CONFIG = {
-    # Data paths
-    "drive_zip_path": "/content/drive/MyDrive/dataverse_files.zip",
-    "work_dir": "/content/ham10000_trustworthy_ai",
+    # Data paths and acquisition
+    "mount_google_drive": True,
+    "google_drive_mount_points": ["/content/drive", "/content/gdrive"],
+    "use_google_drive_for_work_dir": True,
+    "google_drive_work_dir_name": "ham10000_trustworthy_ai",
+    "local_fallback_work_dir": "/content/ham10000_trustworthy_ai",
+    "drive_zip_path": "/content/drive/MyDrive/dataverse_files.zip",  # rewritten after successful Drive mount
+    "work_dir": None,  # resolved below, after mount
     "project_name": "trustworthy_skin_lesion_ai_ham10000_cpu_full",
+    "download_ham10000_dataverse_if_missing": True,
+    "ham10000_dataverse_server": "https://dataverse.harvard.edu",
+    "ham10000_dataverse_persistent_id": "doi:10.7910/DVN/DBW86T",
+    "ham10000_dataverse_download_filename": "dataverse_files.zip",
+    "allow_extracted_ham10000_without_zip": True,
+    "compute_data_zip_md5": False,
+    "ham10000_recursive_drive_zip_search": True,
 
     # Reproducibility
     "seed": 42,
@@ -204,23 +221,108 @@ CONFIG = {
     "bootstrap_reps": 1000,
     "run_bootstrap": True,
     "min_subgroup_n": 30,
+    "calibration_bootstrap_reps": 1000,
+    "ece_acceptability_note": "No universal clinical ECE threshold is assumed. ECE <= 0.05 is treated only as an exploratory desirable calibration target, not as deployment clearance.",
+
+    # Selective referral operating point selected on validation data only
+    "primary_uncertainty_score": "entropy",
+    "referral_target_selective_risk": 0.15,
+    "referral_minimum_validation_coverage": 0.50,
+    "referral_threshold_selection_rule": "maximum validation coverage with selective risk <= target risk; if none, report minimum observed validation risk",
 
     # Uncertainty
     "run_mc_dropout": True,
     "mc_dropout_passes": 20,
     "mc_dropout_max_n": 500,
 
-    # External/stress tests
+    # Related-domain/stress tests
+    "download_isic2018_task3_test_if_missing": True,
+    "isic2018_download_dir": "/content/ISIC2018",
+    "run_isic2018_related_domain_if_found": True,
+    # Backward-compatible alias retained for older cells/scripts; manuscript wording should use related-domain robustness, not external validation.
     "run_isic2018_external_if_found": True,
+    "near_duplicate_dhash_threshold": 5,
     "run_stress_tests": True,
     "stress_test_max_images": 1000,
     "run_gradcam_example": True,
 
-    # Compression
+    # Compression and deployment checks
     "run_tflite_export": True,
+    "tflite_profile_max_n": 200,
+    "tflite_performance_max_n": None,
+    "generate_reviewer_compliance_matrix": True,
 }
 
-WORK_DIR = Path(CONFIG["work_dir"])
+
+def _is_real_colab_drive_mount(mount_base: Path) -> bool:
+    """Return True only when the mount base appears to be a real mounted filesystem."""
+    try:
+        return mount_base.exists() and os.path.ismount(str(mount_base)) and (mount_base / "MyDrive").exists()
+    except Exception:
+        return False
+
+
+def mount_google_drive_safely(config: dict) -> dict:
+    """Mount Google Drive without failing on a polluted /content/drive mountpoint.
+
+    If /content/drive contains locally created files, Colab can refuse to mount there.
+    This function then tries /content/gdrive. If Drive cannot be mounted, the notebook
+    uses a local /content work directory and the data acquisition cell gives manual options.
+    """
+    info = {
+        "requested": bool(config.get("mount_google_drive", True)),
+        "mounted": False,
+        "mount_base": None,
+        "mydrive": None,
+        "errors": [],
+    }
+    if not info["requested"]:
+        info["errors"].append("mount_google_drive is False")
+        return info
+
+    try:
+        from google.colab import drive as colab_drive
+    except Exception as e:
+        info["errors"].append(f"google.colab.drive unavailable: {repr(e)}")
+        return info
+
+    for mount_str in config.get("google_drive_mount_points", ["/content/drive", "/content/gdrive"]):
+        mount_base = Path(mount_str)
+        if _is_real_colab_drive_mount(mount_base):
+            info.update({"mounted": True, "mount_base": str(mount_base), "mydrive": str(mount_base / "MyDrive")})
+            return info
+        try:
+            mount_base.mkdir(parents=True, exist_ok=True)
+            colab_drive.mount(str(mount_base), force_remount=False)
+            if (mount_base / "MyDrive").exists():
+                info.update({"mounted": True, "mount_base": str(mount_base), "mydrive": str(mount_base / "MyDrive")})
+                return info
+            info["errors"].append(f"Mounted attempt at {mount_base}, but MyDrive was not found.")
+        except Exception as e:
+            info["errors"].append(f"{mount_base}: {repr(e)}")
+
+    return info
+
+
+DRIVE_INFO = mount_google_drive_safely(CONFIG)
+MYDRIVE = Path(DRIVE_INFO["mydrive"]) if DRIVE_INFO.get("mounted") else None
+CONFIG["drive_mount_info"] = DRIVE_INFO
+
+if MYDRIVE is not None:
+    WORK_DIR = MYDRIVE / CONFIG["google_drive_work_dir_name"]
+    CONFIG["drive_zip_path"] = str(MYDRIVE / "dataverse_files.zip")
+    print("Google Drive mounted at:", DRIVE_INFO["mount_base"])
+    print("MyDrive path:", MYDRIVE)
+else:
+    WORK_DIR = Path(CONFIG["local_fallback_work_dir"])
+    print("Google Drive not mounted; using local fallback work directory:", WORK_DIR)
+    if DRIVE_INFO.get("errors"):
+        print("Drive mount messages:")
+        for err in DRIVE_INFO["errors"]:
+            print(" -", err)
+
+CONFIG["work_dir"] = str(WORK_DIR)
+
 RAW_DIR = WORK_DIR / "raw"
 DATA_DIR = WORK_DIR / "data"
 SPLIT_DIR = WORK_DIR / "splits"
@@ -231,6 +333,23 @@ CACHE_DIR = WORK_DIR / "cache"
 
 for d in [RAW_DIR, DATA_DIR, SPLIT_DIR, MODEL_DIR, FIG_DIR, RESULT_DIR, CACHE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
+
+# Common places checked by the HAM10000 acquisition cell.
+common_dirs = [
+    str(RAW_DIR),
+    "/content/HAM10000",
+    "/content/ham10000",
+    "/content/data/HAM10000",
+    "/content/data/ham10000",
+]
+if MYDRIVE is not None:
+    common_dirs.extend([
+        str(MYDRIVE / "HAM10000"),
+        str(MYDRIVE / "ham10000"),
+        str(MYDRIVE / "dataverse_files"),
+        str(MYDRIVE / CONFIG["google_drive_work_dir_name"] / "raw"),
+    ])
+CONFIG["ham10000_common_data_dirs"] = list(dict.fromkeys(common_dirs))
 
 with open(WORK_DIR / "config.json", "w") as f:
     json.dump(CONFIG, f, indent=2)
@@ -244,6 +363,74 @@ print("CPU-only full run configuration saved to:", WORK_DIR / "config.json")
 CONFIG
 
 # %% [cell 5]
+# --- Optional official ISIC2018 Task 3 test download ---
+# For the reviewer-requested related-domain robustness analysis, use the official
+# ISIC 2018 Challenge Task 3 TEST input images and TEST ground truth only.
+# These files are not used for training, model selection, temperature fitting,
+# threshold selection, or hyperparameter tuning.
+
+from pathlib import Path
+import urllib.request
+import zipfile
+
+ISIC2018_DIR = Path(CONFIG.get("isic2018_download_dir", "/content/ISIC2018"))
+ISIC2018_DIR.mkdir(parents=True, exist_ok=True)
+
+ISIC2018_TASK3_TEST_FILES = {
+    "ISIC2018_Task3_Test_Input.zip": "https://isic-archive.s3.amazonaws.com/challenges/2018/ISIC2018_Task3_Test_Input.zip",
+    "ISIC2018_Task3_Test_GroundTruth.zip": "https://isic-archive.s3.amazonaws.com/challenges/2018/ISIC2018_Task3_Test_GroundTruth.zip",
+}
+
+isic_download_manifest = {
+    "analysis_scope": "ISIC2018 Task 3 related-domain robustness",
+    "download_dir": str(ISIC2018_DIR),
+    "required_files": ISIC2018_TASK3_TEST_FILES,
+    "uses_training_split": False,
+    "uses_validation_split": False,
+    "uses_test_input_and_test_ground_truth_only": True,
+    "status": "not_attempted",
+}
+
+if CONFIG.get("download_isic2018_task3_test_if_missing", True):
+    try:
+        for fname, url in ISIC2018_TASK3_TEST_FILES.items():
+            out = ISIC2018_DIR / fname
+            if not out.exists() or out.stat().st_size == 0:
+                print(f"Downloading {fname} to {out} ...")
+                urllib.request.urlretrieve(url, out)
+            else:
+                print(f"Already exists: {out}")
+
+        for fname in ISIC2018_TASK3_TEST_FILES:
+            zip_path = ISIC2018_DIR / fname
+            extract_dir = ISIC2018_DIR / fname.replace(".zip", "")
+            marker = extract_dir / ".extracted"
+            extract_dir.mkdir(exist_ok=True)
+            if not marker.exists():
+                print(f"Extracting {fname} -> {extract_dir}")
+                with zipfile.ZipFile(zip_path, "r") as z:
+                    z.extractall(extract_dir)
+                marker.write_text(datetime.now().isoformat())
+            else:
+                print(f"Already extracted: {extract_dir}")
+        isic_download_manifest["status"] = "available_or_downloaded"
+    except Exception as e:
+        # Non-fatal: the main HAM10000 analysis can still run. The ISIC section will write a status file.
+        isic_download_manifest["status"] = "download_failed_nonfatal"
+        isic_download_manifest["error"] = repr(e)
+        print("ISIC2018 download failed non-fatally:", repr(e))
+        print("You can manually download the two official Task 3 test files and place/extract them under:", ISIC2018_DIR)
+else:
+    isic_download_manifest["status"] = "disabled_by_config"
+    print("ISIC2018 automatic download disabled. Place the official Task 3 test input and ground-truth files under:", ISIC2018_DIR)
+
+with open(RESULT_DIR / "isic2018_download_manifest.json", "w") as f:
+    json.dump(isic_download_manifest, f, indent=2)
+
+print("ISIC2018 directory:", ISIC2018_DIR)
+print("Download manifest saved:", RESULT_DIR / "isic2018_download_manifest.json")
+
+# %% [cell 6]
 # --- CPU full-run configuration audit ---
 # This cell fails early if any core switch is not set for the requested CPU-only full retraining run.
 
@@ -265,7 +452,7 @@ print("All major training/evaluation switches are enabled.")
 print("force_retrain:", CONFIG["force_retrain"])
 print("visible GPUs:", tf.config.list_logical_devices("GPU"))
 
-# %% [cell 6]
+# %% [cell 7]
 # --- Reproducibility helpers ---
 
 def set_all_seeds(seed: int = 42, deterministic: bool = False):
@@ -322,45 +509,283 @@ print(env["timestamp"])
 print(env["compute_mode"])
 print("GPUs visible to TensorFlow:", env["gpu_devices_visible_to_tensorflow"])
 
-# %% [cell 8]
-# --- Mount Google Drive ---
-
-try:
-    from google.colab import drive
-    drive.mount('/content/drive')
-except Exception as e:
-    print("Not running inside Colab or Drive already mounted:", e)
-
-zip_path = Path(CONFIG["drive_zip_path"])
-print("Expected zip path:", zip_path)
-print("Exists:", zip_path.exists())
-if zip_path.exists():
-    print("Size GB:", round(zip_path.stat().st_size / 1e9, 3))
-    print("MD5:", file_md5(zip_path))
-else:
-    raise FileNotFoundError(
-        f"Could not find {zip_path}. Check the file is in MyDrive root and named dataverse_files.zip."
-    )
-
 # %% [cell 9]
-# --- Extract outer and nested zip files robustly ---
+# --- Locate or download HAM10000 data without requiring MyDrive/dataverse_files.zip ---
+# This cell fixes the previous FileNotFoundError by searching multiple locations and,
+# if needed, attempting the official Harvard Dataverse API bundle download.
 
-EXTRACT_MARKER = RAW_DIR / ".extracted_dataverse_files"
+from urllib.parse import urlencode
+import urllib.request
 
-if not EXTRACT_MARKER.exists():
-    print("Extracting outer zip. This may take several minutes.")
-    with zipfile.ZipFile(zip_path, 'r') as z:
-        z.extractall(RAW_DIR)
-    EXTRACT_MARKER.write_text(datetime.now().isoformat())
+IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+
+
+def ham10000_data_signature(root: Path, max_examples: int = 8) -> dict:
+    root = Path(root)
+    sig = {
+        "root": str(root),
+        "exists": root.exists(),
+        "image_file_count": 0,
+        "metadata_candidate_count": 0,
+        "zip_candidate_count": 0,
+        "metadata_examples": [],
+        "image_examples": [],
+        "zip_examples": [],
+        "looks_complete": False,
+        "looks_staged": False,
+    }
+    if not root.exists():
+        return sig
+    try:
+        files = [p for p in root.rglob("*") if p.is_file()]
+    except Exception as e:
+        sig["scan_error"] = repr(e)
+        return sig
+
+    image_files = [p for p in files if p.suffix.lower() in IMAGE_EXTS]
+    metadata_files = [p for p in files if "ham10000_metadata" in p.name.lower()]
+    zip_files = [p for p in files if p.suffix.lower() == ".zip"]
+
+    sig["image_file_count"] = len(image_files)
+    sig["metadata_candidate_count"] = len(metadata_files)
+    sig["zip_candidate_count"] = len(zip_files)
+    sig["metadata_examples"] = [str(p) for p in metadata_files[:max_examples]]
+    sig["image_examples"] = [str(p) for p in image_files[:max_examples]]
+    sig["zip_examples"] = [str(p) for p in zip_files[:max_examples]]
+    sig["looks_complete"] = sig["image_file_count"] >= 9000 and sig["metadata_candidate_count"] >= 1
+    # Staged means metadata plus image zip(s), before nested extraction.
+    sig["looks_staged"] = sig["metadata_candidate_count"] >= 1 and (
+        sig["image_file_count"] >= 9000 or sig["zip_candidate_count"] >= 1
+    )
+    return sig
+
+
+def find_existing_ham10000_root(candidate_dirs):
+    signatures = []
+    for d in candidate_dirs:
+        sig = ham10000_data_signature(Path(d))
+        signatures.append(sig)
+        if sig["looks_complete"] or sig["looks_staged"]:
+            return Path(sig["root"]), signatures
+    return None, signatures
+
+
+def candidate_zip_paths() -> list:
+    candidates = []
+    explicit = CONFIG.get("drive_zip_path")
+    if explicit:
+        candidates.append(Path(explicit))
+    candidates.extend([
+        Path("/content/dataverse_files.zip"),
+        WORK_DIR / "dataverse_files.zip",
+        RAW_DIR / "dataverse_files.zip",
+        Path("/content/drive/MyDrive/dataverse_files.zip"),
+        Path("/content/gdrive/MyDrive/dataverse_files.zip"),
+    ])
+    if MYDRIVE is not None:
+        candidates.extend([
+            MYDRIVE / "dataverse_files.zip",
+            MYDRIVE / "HAM10000.zip",
+            MYDRIVE / "ham10000.zip",
+        ])
+        try:
+            drive_zip_iter = (
+                MYDRIVE.rglob("*.zip")
+                if CONFIG.get("ham10000_recursive_drive_zip_search", True)
+                else MYDRIVE.glob("*.zip")
+            )
+            for p in drive_zip_iter:
+                name = p.name.lower()
+                if "isic2018_task3" in name:
+                    continue
+                if any(token in name for token in ["dataverse", "dbw86t", "ham10000"]):
+                    candidates.append(p)
+        except Exception as e:
+            print("Could not scan MyDrive zip files:", repr(e))
+    # De-duplicate while preserving order.
+    out = []
+    seen = set()
+    for p in candidates:
+        key = str(p)
+        if key not in seen:
+            out.append(p)
+            seen.add(key)
+    return out
+
+
+def build_dataverse_download_url() -> str:
+    server = CONFIG.get("ham10000_dataverse_server", "https://dataverse.harvard.edu").rstrip("/")
+    pid = CONFIG.get("ham10000_dataverse_persistent_id", "doi:10.7910/DVN/DBW86T")
+    params = urlencode({"persistentId": pid, "format": "original"})
+    return f"{server}/api/access/dataset/:persistentId/?{params}"
+
+
+def download_file_with_progress(url: str, out_path: Path, chunk_size: int = 2**20) -> Path:
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_suffix(out_path.suffix + ".part")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 Colab HAM10000 reproducibility workflow"})
+    print("Downloading:", url)
+    print("Destination:", out_path)
+    with urllib.request.urlopen(req, timeout=60) as response, open(tmp_path, "wb") as f:
+        total = int(response.headers.get("Content-Length") or 0)
+        downloaded = 0
+        last_print = 0
+        while True:
+            chunk = response.read(chunk_size)
+            if not chunk:
+                break
+            f.write(chunk)
+            downloaded += len(chunk)
+            if total:
+                pct = downloaded / total * 100
+                if pct - last_print >= 5 or pct >= 100:
+                    print(f"  {downloaded/1e9:.2f}/{total/1e9:.2f} GB ({pct:.1f}%)")
+                    last_print = pct
+            elif downloaded // (250 * 2**20) > (downloaded - len(chunk)) // (250 * 2**20):
+                print(f"  downloaded {downloaded/1e9:.2f} GB")
+    tmp_path.replace(out_path)
+    return out_path
+
+
+acquisition_manifest = {
+    "timestamp": datetime.now().isoformat(),
+    "status": "not_started",
+    "drive_info": DRIVE_INFO,
+    "candidate_data_dirs": CONFIG.get("ham10000_common_data_dirs", []),
+    "candidate_zip_paths": [str(p) for p in candidate_zip_paths()],
+    "selected_data_root": None,
+    "selected_zip_path": None,
+    "download_attempted": False,
+    "download_url": None,
+    "notes": [],
+}
+
+# 1) Prefer already extracted or staged data.
+existing_root, scanned_sigs = find_existing_ham10000_root(CONFIG.get("ham10000_common_data_dirs", []))
+acquisition_manifest["scanned_data_dir_signatures"] = scanned_sigs
+
+zip_path = None
+if existing_root is not None and CONFIG.get("allow_extracted_ham10000_without_zip", True):
+    RAW_DIR = Path(existing_root)
+    acquisition_manifest["status"] = "using_existing_extracted_or_staged_data"
+    acquisition_manifest["selected_data_root"] = str(RAW_DIR)
+    print("Using existing HAM10000 data root:", RAW_DIR)
 else:
-    print("Outer zip already extracted:", EXTRACT_MARKER.read_text())
+    # 2) Look for a local Dataverse/HAM10000 zip.
+    for candidate in candidate_zip_paths():
+        if candidate.exists() and candidate.stat().st_size > 0:
+            zip_path = candidate
+            break
 
-# Recursively extract nested zips, but do not repeat extraction if marker exists.
-def extract_nested_zips(root: Path, max_rounds: int = 4):
+    if zip_path is not None:
+        acquisition_manifest["status"] = "using_local_zip"
+        acquisition_manifest["selected_zip_path"] = str(zip_path)
+        print("Using local HAM10000 zip:", zip_path)
+        print("Size GB:", round(zip_path.stat().st_size / 1e9, 3))
+        if CONFIG.get("compute_data_zip_md5", False):
+            print("MD5:", file_md5(zip_path))
+    else:
+        # 3) Try the official Harvard Dataverse API bundle download.
+        if CONFIG.get("download_ham10000_dataverse_if_missing", True):
+            acquisition_manifest["download_attempted"] = True
+            download_url = build_dataverse_download_url()
+            acquisition_manifest["download_url"] = download_url
+            zip_path = RAW_DIR / CONFIG.get("ham10000_dataverse_download_filename", "dataverse_files.zip")
+            try:
+                print("No existing HAM10000 data root or local dataverse_files.zip was found.")
+                print("Attempting official Harvard Dataverse API download. This is a large multi-GB download.")
+                download_file_with_progress(download_url, zip_path)
+                if not zipfile.is_zipfile(zip_path):
+                    preview = zip_path.read_bytes()[:300]
+                    raise zipfile.BadZipFile(
+                        "Downloaded file is not a valid zip. First bytes: " + repr(preview)
+                    )
+                acquisition_manifest["status"] = "downloaded_official_dataverse_zip"
+                acquisition_manifest["selected_zip_path"] = str(zip_path)
+                print("Downloaded valid zip:", zip_path)
+                print("Size GB:", round(zip_path.stat().st_size / 1e9, 3))
+            except Exception as e:
+                acquisition_manifest["status"] = "missing_data_download_failed"
+                acquisition_manifest["error"] = repr(e)
+                with open(RESULT_DIR / "ham10000_acquisition_manifest.json", "w") as f:
+                    json.dump(acquisition_manifest, f, indent=2)
+                raise FileNotFoundError(
+                    "HAM10000 data were not found locally, and the official Harvard Dataverse API download failed. "
+                    "Manual fix: download the HAM10000 Harvard Dataverse bundle for DOI 10.7910/DVN/DBW86T, "
+                    "upload it to your Google Drive root as dataverse_files.zip, restart Colab, and rerun from the first cell. "
+                    f"Attempted URL: {download_url}. Original error: {repr(e)}"
+                ) from e
+        else:
+            acquisition_manifest["status"] = "missing_data_download_disabled"
+            with open(RESULT_DIR / "ham10000_acquisition_manifest.json", "w") as f:
+                json.dump(acquisition_manifest, f, indent=2)
+            raise FileNotFoundError(
+                "HAM10000 data were not found. Place dataverse_files.zip in MyDrive root, /content, WORK_DIR, or RAW_DIR; "
+                "or set CONFIG['download_ham10000_dataverse_if_missing']=True."
+            )
+
+with open(RESULT_DIR / "ham10000_acquisition_manifest.json", "w") as f:
+    json.dump(acquisition_manifest, f, indent=2)
+
+print("HAM10000 acquisition status:", acquisition_manifest["status"])
+print("Effective RAW_DIR:", RAW_DIR)
+print("Manifest saved:", RESULT_DIR / "ham10000_acquisition_manifest.json")
+
+# %% [cell 10]
+# --- Extract selected HAM10000 archive and nested zip files robustly ---
+# Handles either:
+#   A) zip_path points to a Dataverse bundle / HAM10000 archive, or
+#   B) RAW_DIR already contains extracted or staged HAM10000 data.
+
+active_zip_path = Path(zip_path) if "zip_path" in globals() and zip_path is not None else None
+
+
+def extract_zip_once(zp: Path, out_dir: Path, marker_name: str):
+    zp = Path(zp)
+    out_dir = Path(out_dir)
+    marker = out_dir / marker_name
+    sig_before = ham10000_data_signature(out_dir)
+    already_has_assets = sig_before.get("looks_staged", False) or sig_before.get("looks_complete", False)
+
+    if already_has_assets and marker.exists():
+        print("Archive extraction already completed:", marker)
+        return
+
+    if not zp.exists():
+        raise FileNotFoundError(f"Selected zip path does not exist: {zp}")
+    if not zipfile.is_zipfile(zp):
+        raise zipfile.BadZipFile(f"Selected file is not a valid zip: {zp}")
+
+    print("Extracting archive:", zp)
+    print("Extracting to:", out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zp, "r") as z:
+        z.extractall(out_dir)
+    marker.write_text(datetime.now().isoformat())
+
+
+# If a zip was selected, extract it to RAW_DIR unless RAW_DIR already contains usable staged/complete data.
+outer_zip_resolved = None
+if active_zip_path is not None:
+    outer_zip_resolved = active_zip_path.resolve()
+    extract_zip_once(active_zip_path, RAW_DIR, ".extracted_outer_ham10000_archive")
+else:
+    print("No outer zip selected; assuming RAW_DIR already contains extracted or staged HAM10000 files:", RAW_DIR)
+
+
+def extract_nested_zips(root: Path, max_rounds: int = 4, skip_paths=None):
+    skip_paths = {Path(p).resolve() for p in (skip_paths or []) if p is not None}
+    root = Path(root)
     for round_id in range(max_rounds):
-        zips = list(root.rglob("*.zip"))
+        zips = sorted(root.rglob("*.zip"))
         new_count = 0
         for zp in zips:
+            try:
+                if zp.resolve() in skip_paths:
+                    continue
+            except Exception:
+                pass
             marker = zp.with_suffix(zp.suffix + ".extracted")
             out_dir = zp.with_suffix("")
             if marker.exists():
@@ -368,22 +793,50 @@ def extract_nested_zips(root: Path, max_rounds: int = 4):
             out_dir.mkdir(parents=True, exist_ok=True)
             print(f"Extracting nested zip: {zp.name} -> {out_dir}")
             try:
-                with zipfile.ZipFile(zp, 'r') as z:
+                with zipfile.ZipFile(zp, "r") as z:
                     z.extractall(out_dir)
                 marker.write_text(datetime.now().isoformat())
                 new_count += 1
             except zipfile.BadZipFile:
-                print("Bad zip or not a real zip:", zp)
+                print("Skipping bad zip or non-zip file with .zip extension:", zp)
         if new_count == 0:
             break
 
-extract_nested_zips(RAW_DIR)
 
-# Show high-level extracted structure
+extract_nested_zips(RAW_DIR, skip_paths=[outer_zip_resolved])
+
+final_sig = ham10000_data_signature(RAW_DIR)
+with open(RESULT_DIR / "ham10000_post_extraction_signature.json", "w") as f:
+    json.dump(final_sig, f, indent=2)
+
+print("Post-extraction HAM10000 signature:")
+print(json.dumps({
+    "root": final_sig["root"],
+    "image_file_count": final_sig["image_file_count"],
+    "metadata_candidate_count": final_sig["metadata_candidate_count"],
+    "zip_candidate_count": final_sig["zip_candidate_count"],
+    "looks_complete": final_sig["looks_complete"],
+    "looks_staged": final_sig["looks_staged"],
+    "metadata_examples": final_sig["metadata_examples"][:3],
+    "image_examples": final_sig["image_examples"][:3],
+}, indent=2))
+
+if not final_sig["looks_complete"]:
+    raise FileNotFoundError(
+        "HAM10000 extraction did not produce both metadata and at least 9000 image files. "
+        "Open results/ham10000_acquisition_manifest.json and results/ham10000_post_extraction_signature.json "
+        "to see what was found. Expected HAM10000_metadata plus HAM10000_images_part_1/part_2 contents."
+    )
+
+print("High-level RAW_DIR structure:")
 for p in sorted(RAW_DIR.iterdir()):
-    print("DIR " if p.is_dir() else "FILE", p.name, round(p.stat().st_size/1e6, 2), "MB" if p.is_file() else "")
+    try:
+        size_mb = round(p.stat().st_size / 1e6, 2) if p.is_file() else ""
+        print("DIR " if p.is_dir() else "FILE", p.name, size_mb, "MB" if p.is_file() else "")
+    except Exception as e:
+        print("Could not stat:", p, repr(e))
 
-# %% [cell 11]
+# %% [cell 12]
 # --- Locate files ---
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
@@ -407,7 +860,7 @@ for p in metadata_candidates:
     print(" -", p, round(p.stat().st_size/1024, 1), "KB")
 
 if not metadata_candidates:
-    raise FileNotFoundError("Could not find HAM10000_metadata in extracted files.")
+    raise FileNotFoundError("Could not find HAM10000_metadata in effective RAW_DIR. Check results/ham10000_acquisition_manifest.json and results/ham10000_post_extraction_signature.json. If the Dataverse API failed, manually place dataverse_files.zip in MyDrive root and rerun from the top.")
 
 # Prefer csv-looking candidates, but read extensionless files too.
 metadata_path = sorted(metadata_candidates, key=lambda p: (p.suffix.lower() != ".csv", len(str(p))))[0]
@@ -422,7 +875,7 @@ for p in image_files:
 
 print("Unique image ids:", len(image_path_map))
 
-# %% [cell 12]
+# %% [cell 13]
 # --- Load metadata robustly ---
 
 try:
@@ -469,7 +922,7 @@ clean_metadata_path = DATA_DIR / "ham10000_metadata_clean_with_paths.csv"
 meta.to_csv(clean_metadata_path, index=False)
 print("Saved:", clean_metadata_path)
 
-# %% [cell 14]
+# %% [cell 15]
 # --- Data audit tables ---
 
 def audit_ham10000(df):
@@ -504,7 +957,7 @@ for name, tab in meta_summary.items():
     display(tab.to_frame("n"))
     tab.to_csv(RESULT_DIR / f"metadata_distribution_{name}.csv")
 
-# %% [cell 15]
+# %% [cell 16]
 # --- EDA figures ---
 
 def save_bar(series, title, xlabel, ylabel, out_path, rotation=0):
@@ -523,7 +976,7 @@ save_bar(meta["dx_type"].fillna("missing").value_counts(), "Diagnosis confirmati
 save_bar(meta["sex"].fillna("missing").value_counts(), "Sex distribution", "sex", "Images", FIG_DIR / "sex_distribution.png")
 save_bar(meta["localization"].fillna("missing").value_counts().head(20), "Top anatomical sites", "localization", "Images", FIG_DIR / "localization_distribution.png", rotation=75)
 
-# %% [cell 17]
+# %% [cell 18]
 # --- Grouped stratified split with fallback ---
 
 def stratified_group_split(df, label_col="label", group_col="lesion_id", test_size=0.2, seed=42):
@@ -584,7 +1037,75 @@ split_all = pd.concat([train_df, val_df, test_df], axis=0).reset_index(drop=True
 split_all.to_csv(SPLIT_DIR / "ham10000_lesion_level_split_all.csv", index=False)
 print("Saved split files to", SPLIT_DIR)
 
-# %% [cell 18]
+# Reviewer/editor export: full lesion-level split protocol and class distributions.
+split_method = "StratifiedGroupKFold" if HAS_SGK else "GroupShuffleSplit fallback"
+split_protocol = {
+    "split_by": CONFIG["split_by"],
+    "group_col": "lesion_id",
+    "label_col": "dx",
+    "label_index_col": "label",
+    "class_order": CLASS_NAMES,
+    "stratification_method": split_method,
+    "stratified_group_kfold_available": bool(HAS_SGK),
+    "test_size_requested": CONFIG["test_size"],
+    "validation_size_within_trainval_requested": CONFIG["val_size_of_trainval"],
+    "effective_train_fraction": len(train_df) / len(meta),
+    "effective_validation_fraction": len(val_df) / len(meta),
+    "effective_test_fraction": len(test_df) / len(meta),
+    "first_split_seed": CONFIG["seed"],
+    "second_split_seed": CONFIG["seed"] + 1,
+    "n_images_total": int(len(meta)),
+    "n_lesions_total": int(meta["lesion_id"].nunique()),
+    "n_images_train": int(len(train_df)),
+    "n_images_validation": int(len(val_df)),
+    "n_images_test": int(len(test_df)),
+    "n_lesions_train": int(train_df["lesion_id"].nunique()),
+    "n_lesions_validation": int(val_df["lesion_id"].nunique()),
+    "n_lesions_test": int(test_df["lesion_id"].nunique()),
+    "leakage_checks": "no lesion_id overlap across train, validation, and test; image_id overlap is also exported; assertions above fail the notebook if lesion leakage is detected",
+}
+
+split_class_rows = []
+for split_name, df_split in [("train", train_df), ("validation", val_df), ("test", test_df)]:
+    counts = df_split["dx"].value_counts().reindex(CLASS_NAMES).fillna(0).astype(int)
+    for cls in CLASS_NAMES:
+        split_class_rows.append({
+            "split": split_name,
+            "class": cls,
+            "n_images": int(counts.loc[cls]),
+            "proportion_within_split": float(counts.loc[cls] / max(len(df_split), 1)),
+            "n_lesions": int(df_split.loc[df_split["dx"] == cls, "lesion_id"].nunique()),
+        })
+split_class_distribution = pd.DataFrame(split_class_rows)
+split_class_distribution.to_csv(RESULT_DIR / "reviewer_split_class_distribution.csv", index=False)
+
+split_overlaps = []
+for a_name, a_df, b_name, b_df in [
+    ("train", train_df, "validation", val_df),
+    ("train", train_df, "test", test_df),
+    ("validation", val_df, "test", test_df),
+]:
+    lesion_overlap = sorted(set(a_df["lesion_id"].astype(str)) & set(b_df["lesion_id"].astype(str)))
+    image_overlap = sorted(set(a_df["image_id"].astype(str)) & set(b_df["image_id"].astype(str)))
+    split_overlaps.append({
+        "split_a": a_name,
+        "split_b": b_name,
+        "lesion_id_overlap_n": int(len(lesion_overlap)),
+        "image_id_overlap_n": int(len(image_overlap)),
+        "lesion_overlap_examples": ";".join(lesion_overlap[:10]),
+        "image_overlap_examples": ";".join(image_overlap[:10]),
+    })
+pd.DataFrame(split_overlaps).to_csv(RESULT_DIR / "reviewer_split_internal_overlap_checks.csv", index=False)
+# Backward-compatible filename requested by earlier draft.
+pd.DataFrame(split_overlaps).to_csv(RESULT_DIR / "reviewer_split_lesion_overlap_checks.csv", index=False)
+
+with open(RESULT_DIR / "reviewer_split_protocol_summary.json", "w") as f:
+    json.dump(split_protocol, f, indent=2)
+
+print("Reviewer split protocol saved:", RESULT_DIR / "reviewer_split_protocol_summary.json")
+display(split_class_distribution)
+
+# %% [cell 19]
 # --- Split distribution figure ---
 
 split_counts = split_all.pivot_table(index="dx", columns="split", values="image_id", aggfunc="count").reindex(CLASS_NAMES).fillna(0)
@@ -600,7 +1121,7 @@ fig.tight_layout()
 fig.savefig(FIG_DIR / "split_class_distribution.png", dpi=200)
 plt.show()
 
-# %% [cell 20]
+# %% [cell 21]
 # --- Train-only metadata preprocessing ---
 # Predictive metadata should include only variables plausibly available before diagnosis.
 #
@@ -687,7 +1208,7 @@ print("Subgroup-only variables:", SUBGROUP_VARIABLES)
 print("First 10 metadata features:", meta_pre.feature_names_[:10])
 print("Confirmed: dx_type is excluded from model inputs and retained only for subgroup analysis.")
 
-# %% [cell 22]
+# %% [cell 23]
 # --- Data pipeline: CPU-only Python/PIL sequence for images ---
 # This cell intentionally does NOT use tf.data.
 # Reason: earlier failures occurred during TensorFlow device-side dataset/tensor construction.
@@ -990,7 +1511,7 @@ if bool(CONFIG.get("preview_tfdata_batch", False)):
 else:
     print("Batch preview skipped. The first batch will be loaded at fit/evaluation time.")
 
-# %% [cell 23]
+# %% [cell 24]
 # --- Visual sanity check: samples from the training split ---
 
 sample_df = train_df.sample(min(12, len(train_df)), random_state=CONFIG["seed"])
@@ -1005,7 +1526,7 @@ fig.tight_layout()
 fig.savefig(FIG_DIR / "training_examples_grid.png", dpi=200)
 plt.show()
 
-# %% [cell 25]
+# %% [cell 26]
 # --- Losses and model builders: CPU-only publishable version ---
 # This cell defines losses and model constructors only.
 # Model construction is CPU-only by design, avoiding all CUDA/CuDNN paths.
@@ -1196,7 +1717,7 @@ else:
     print("Model-builder cell loaded. Preview build skipped for speed/stability.")
     print("Backbone:", CONFIG["backbone"], "| use_metadata:", CONFIG["use_metadata"], "| N_CLASSES:", N_CLASSES)
 
-# %% [cell 27]
+# %% [cell 28]
 # --- Training utilities: CPU-only full-run version ---
 
 def model_uses_metadata(model):
@@ -1210,7 +1731,14 @@ def model_uses_metadata(model):
 
 
 def unfreeze_last_n_layers(model, n_last=40):
-    """Unfreeze the last n layers of the nested application backbone, keeping BatchNorm frozen."""
+    """Unfreeze the last n layers of the nested application backbone, keeping BatchNorm frozen.
+
+    Important Keras detail:
+    For nested application models, the parent backbone model must be set trainable=True
+    before individual child layers can contribute trainable weights. This function records
+    the actual trainable layers/parameters so the fine-tuning protocol is auditable.
+    """
+    # Freeze all top-level layers first.
     for layer in model.layers:
         layer.trainable = False
 
@@ -1220,20 +1748,48 @@ def unfreeze_last_n_layers(model, n_last=40):
             backbone = layer
             break
 
-    if backbone is None:
-        backbone = model
+    fine_tuned_backbone_layers = []
 
-    trainable_count = 0
-    for layer in backbone.layers[-int(n_last):]:
-        if not isinstance(layer, layers.BatchNormalization):
-            layer.trainable = True
-            trainable_count += 1
+    if backbone is not None:
+        # Re-enable the nested backbone container, then selectively unfreeze child layers.
+        backbone.trainable = True
+        for layer in backbone.layers:
+            layer.trainable = False
 
+        for layer in backbone.layers[-int(n_last):]:
+            if not isinstance(layer, layers.BatchNormalization):
+                layer.trainable = True
+                fine_tuned_backbone_layers.append(layer.name)
+    else:
+        # Fallback for a non-nested model. This path is not expected for the application backbones.
+        for layer in model.layers[-int(n_last):]:
+            if not isinstance(layer, layers.BatchNormalization):
+                layer.trainable = True
+                fine_tuned_backbone_layers.append(layer.name)
+
+    top_trainable_layers = []
     for layer in model.layers:
         if layer.name.startswith(("classifier", "logits", "metadata", "late_fusion")) and not isinstance(layer, layers.BatchNormalization):
             layer.trainable = True
+            top_trainable_layers.append(layer.name)
 
-    print("Unfroze backbone layers:", trainable_count)
+    trainable_parameter_count = int(np.sum([np.prod(w.shape) for w in model.trainable_weights]))
+    trainable_weight_count = int(len(model.trainable_weights))
+
+    report = {
+        "requested_last_n_backbone_layers": int(n_last),
+        "backbone_model_name": backbone.name if backbone is not None else "not_found_non_nested_fallback",
+        "batchnorm_layers_kept_frozen": True,
+        "fine_tuned_backbone_layer_names": fine_tuned_backbone_layers,
+        "top_level_trainable_layer_names": top_trainable_layers,
+        "trainable_weight_count_after_unfreeze": trainable_weight_count,
+        "trainable_parameter_count_after_unfreeze": trainable_parameter_count,
+    }
+    model._fine_tune_report = report
+
+    print("Unfroze backbone layers:", len(fine_tuned_backbone_layers))
+    print("Trainable weights after unfreeze:", trainable_weight_count)
+    print("Trainable parameters after unfreeze:", trainable_parameter_count)
     return model
 
 
@@ -1333,8 +1889,16 @@ def train_one_model(backbone_name, use_metadata, seed, loss_type="weighted_ce", 
     )
     head_seconds = time.time() - t0
 
+    best_head_path = out_dir / "best_head.weights.h5"
+    if best_head_path.exists():
+        model.load_weights(best_head_path)
+        print("Loaded best head-stage validation-loss weights:", best_head_path)
+
     print(f"Stage 2: fine-tuning | {run_tag}")
     model = unfreeze_last_n_layers(model, CONFIG["finetune_last_n_layers"])
+    fine_tune_report = getattr(model, "_fine_tune_report", {})
+    with open(out_dir / "fine_tuned_layers_after_unfreeze.json", "w") as f:
+        json.dump(fine_tune_report, f, indent=2)
     compile_model(model, CONFIG["finetune_learning_rate"], loss_type)
 
     callbacks_ft = [
@@ -1354,6 +1918,11 @@ def train_one_model(backbone_name, use_metadata, seed, loss_type="weighted_ce", 
         stage_name=f"fine-tuning: {run_tag}",
     )
     ft_seconds = time.time() - t1
+
+    best_ft_path = out_dir / "best_finetuned.weights.h5"
+    if best_ft_path.exists():
+        model.load_weights(best_ft_path)
+        print("Loaded best fine-tuning validation-loss weights before final save:", best_ft_path)
 
     # Save without optimizer to avoid serializing custom losses/optimizer state.
     with tf.device("/CPU:0"):
@@ -1384,7 +1953,93 @@ def train_one_model(backbone_name, use_metadata, seed, loss_type="weighted_ce", 
 
 print("Training utility ready. Model build/compile/training are CPU-only.")
 
-# %% [cell 28]
+# %% [cell 29]
+# --- Reviewer/editor export: complete training and preprocessing details ---
+# This cell writes the method details requested by the editor in a machine-readable form.
+
+import platform
+import sklearn
+
+training_details = {
+    "optimizer": "Adam",
+    "head_learning_rate_initial": CONFIG["head_learning_rate"],
+    "finetune_learning_rate_initial": CONFIG["finetune_learning_rate"],
+    "lr_schedule_head": "ReduceLROnPlateau(monitor='val_loss', factor=0.3, patience=2, min_lr=1e-6)",
+    "lr_schedule_finetune": "ReduceLROnPlateau(monitor='val_loss', factor=0.3, patience=2, min_lr=1e-7)",
+    "head_epochs_max": CONFIG["head_epochs"],
+    "finetune_epochs_max": CONFIG["finetune_epochs"],
+    "early_stopping": f"EarlyStopping(monitor='val_loss', patience={CONFIG['early_stopping_patience']}, restore_best_weights=True)",
+    "model_checkpointing": "best validation-loss weights saved separately for head and fine-tuning stages",
+    "batch_size": CONFIG["batch_size"],
+    "image_size": CONFIG["image_size"],
+    "dropout_rate": CONFIG["dropout_rate"],
+    "primary_loss_type": CONFIG["loss_type"],
+    "focal_gamma": CONFIG["focal_gamma"],
+    "class_balanced_beta": CONFIG["class_balanced_beta"],
+    "class_order": CLASS_NAMES,
+    "inverse_frequency_class_weights": {CLASS_NAMES[i]: float(class_weights_arr[i]) for i in range(N_CLASSES)},
+    "effective_number_class_balanced_weights": {CLASS_NAMES[i]: float(class_balanced_weights_arr[i]) for i in range(N_CLASSES)},
+    "fine_tuning": {
+        "stage_1": "ImageNet backbone frozen; classifier head trained",
+        "stage_2": f"last {CONFIG['finetune_last_n_layers']} backbone layers considered for unfreezing; BatchNorm layers kept frozen; classifier head trainable",
+        "auditable_layer_export": "Each model directory writes fine_tuned_layers_after_unfreeze.json with actual trainable backbone/top layers and trainable-parameter count.",
+    },
+    "augmentation_train_only": {
+        "horizontal_flip_probability": 0.5,
+        "vertical_flip_probability": 0.5,
+        "brightness_factor_uniform": [0.90, 1.10],
+        "contrast_factor_uniform": [0.90, 1.10],
+        "central_crop_fraction_uniform": [0.90, 1.00],
+        "validation_test_augmentation": "none",
+    },
+    "image_preprocessing": {
+        "read": "PIL ImageOps.exif_transpose, RGB conversion",
+        "resize": f"{CONFIG['image_size']}x{CONFIG['image_size']} bilinear",
+        "numeric_scale": "float32 RGB in 0-255 scale before model-specific preprocessing",
+        "EfficientNetB0": "Keras EfficientNet internal preprocessing/rescaling path; identity layer documents 0-255 input scale",
+        "ResNet50": "tf.keras.applications.resnet50.preprocess_input layer inside model graph",
+        "MobileNetV2": "tf.keras.applications.mobilenet_v2.preprocess_input layer inside model graph",
+        "DenseNet121": "tf.keras.applications.densenet.preprocess_input layer inside model graph if used",
+    },
+    "metadata_inputs_for_multimodal_ablation": {
+        "included": META_NUMERIC_COLS + META_CATEGORICAL_COLS,
+        "excluded": ["dx_type"],
+        "exclusion_reason": "dx_type records diagnostic-confirmation pathway and is reserved for subgroup analysis to avoid post-outcome leakage",
+        "preprocessing_fit_scope": "train split only",
+    },
+    "software_versions": {
+        "python": sys.version,
+        "platform": platform.platform(),
+        "tensorflow": tf.__version__,
+        "keras": tf.keras.__version__ if hasattr(tf.keras, "__version__") else "tf.keras bundled",
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+        "scikit_learn": sklearn.__version__,
+        "PIL": Image.__version__ if hasattr(Image, "__version__") else "unknown",
+    },
+    "hardware": {
+        "compute_mode": "CPU-only in this notebook run",
+        "visible_gpus_to_tensorflow": [str(x) for x in tf.config.list_physical_devices("GPU")],
+        "cpu_devices": [str(x) for x in tf.config.list_physical_devices("CPU")],
+        "mixed_precision_policy": str(tf.keras.mixed_precision.global_policy()),
+    },
+}
+
+with open(RESULT_DIR / "reviewer_training_reproducibility_details.json", "w") as f:
+    json.dump(training_details, f, indent=2)
+
+class_weight_export = pd.DataFrame({
+    "class": CLASS_NAMES,
+    "inverse_frequency_weight": [float(x) for x in class_weights_arr],
+    "effective_number_weight": [float(x) for x in class_balanced_weights_arr],
+})
+class_weight_export.to_csv(RESULT_DIR / "reviewer_class_weight_values.csv", index=False)
+
+display(class_weight_export)
+print("Saved:", RESULT_DIR / "reviewer_training_reproducibility_details.json")
+print("Saved:", RESULT_DIR / "reviewer_class_weight_values.csv")
+
+# %% [cell 30]
 # --- Main baseline training cell ---
 # This trains the first image-only baseline configured in CONFIG.
 
@@ -1406,7 +2061,7 @@ if RUN_TRAINING:
 else:
     print("Training skipped. Set CONFIG['run_training']=True when ready.")
 
-# %% [cell 29]
+# %% [cell 31]
 # --- Model comparison funnel, long-tail loss ablation, and repeated-seed final run ---
 # These runs are enabled for publication-grade evidence. Existing models are reused unless CONFIG["force_retrain"]=True.
 
@@ -1461,7 +2116,7 @@ if baseline_model is None:
         baseline_dir = primary_path.parent
         print("Loaded primary baseline after funnel:", primary_path)
 
-# %% [cell 31]
+# %% [cell 33]
 # --- Prediction and metric utilities ---
 
 def compatible_datasets_for_model(model, loss_type=None):
@@ -1510,6 +2165,7 @@ def multiclass_brier(y_true, probs):
 
 
 def expected_calibration_error(y_true, probs, n_bins=15):
+    """Top-label ECE using equal-width confidence bins over [0, 1]."""
     conf = probs.max(axis=1)
     pred = probs.argmax(axis=1)
     correct = (pred == y_true).astype(float)
@@ -1518,7 +2174,11 @@ def expected_calibration_error(y_true, probs, n_bins=15):
     bin_rows = []
     for i in range(n_bins):
         lo, hi = bins[i], bins[i+1]
-        mask = (conf > lo) & (conf <= hi) if i > 0 else (conf >= lo) & (conf <= hi)
+        # Left-closed/right-open except the final bin, which includes 1.0.
+        if i == n_bins - 1:
+            mask = (conf >= lo) & (conf <= hi)
+        else:
+            mask = (conf >= lo) & (conf < hi)
         n = int(mask.sum())
         if n > 0:
             acc = float(correct[mask].mean())
@@ -1529,6 +2189,37 @@ def expected_calibration_error(y_true, probs, n_bins=15):
         else:
             bin_rows.append({"bin": i, "lo": lo, "hi": hi, "n": 0, "accuracy": np.nan, "confidence": np.nan, "gap": np.nan})
     return float(ece), pd.DataFrame(bin_rows)
+
+
+def maximum_calibration_error(y_true, probs, n_bins=15):
+    """Maximum absolute top-label calibration gap across non-empty bins."""
+    _, bins = expected_calibration_error(y_true, probs, n_bins=n_bins)
+    gaps = bins.loc[bins["n"] > 0, "gap"].dropna()
+    return float(gaps.max()) if len(gaps) else np.nan
+
+
+def fit_temperature_scaling(logits_val, y_val, max_iter=500, lr=0.05):
+    """Fit a single scalar temperature on validation logits only."""
+    logits_tf = tf.constant(logits_val, dtype=tf.float32)
+    y_tf = tf.constant(y_val, dtype=tf.int32)
+    log_t = tf.Variable(0.0, dtype=tf.float32)
+    opt = tf.keras.optimizers.Adam(learning_rate=lr)
+
+    best_loss = np.inf
+    best_t = 1.0
+    for _ in range(max_iter):
+        with tf.GradientTape() as tape:
+            t = tf.exp(log_t)
+            scaled = logits_tf / t
+            loss = tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(y_tf, scaled, from_logits=True))
+        grads = tape.gradient(loss, [log_t])
+        opt.apply_gradients(zip(grads, [log_t]))
+        loss_val = float(loss.numpy())
+        t_val = float(tf.exp(log_t).numpy())
+        if loss_val < best_loss:
+            best_loss = loss_val
+            best_t = t_val
+    return best_t, best_loss
 
 
 def evaluate_probs(y_true, probs, prefix=""):
@@ -1543,6 +2234,8 @@ def evaluate_probs(y_true, probs, prefix=""):
     out[prefix + "brier"] = multiclass_brier(y_true, probs)
     out[prefix + "nll"] = log_loss(y_true, np.clip(probs, 1e-7, 1-1e-7), labels=np.arange(probs.shape[1]))
     out[prefix + "ece"], _ = expected_calibration_error(y_true, probs, CONFIG["n_bins_ece"])
+    out[prefix + "mce"] = maximum_calibration_error(y_true, probs, CONFIG["n_bins_ece"])
+    out[prefix + "ece_n_bins"] = int(CONFIG["n_bins_ece"])
     try:
         out[prefix + "ovr_roc_auc_macro"] = roc_auc_score(y_oh, probs, average="macro", multi_class="ovr")
     except Exception:
@@ -1564,7 +2257,7 @@ def per_class_table(y_true, probs):
         })
     return pd.DataFrame(rows)
 
-# %% [cell 32]
+# %% [cell 34]
 # --- Choose model for evaluation: validation-selected, test-blind ---
 # Publishable rule:
 #   The final model for held-out test evaluation must be selected using validation data only.
@@ -1818,7 +2511,7 @@ else:
     _, val_ds_eval, test_ds_eval = compatible_datasets_for_model(model_eval)
     print("Compatible validation and test datasets prepared.")
 
-# %% [cell 33]
+# %% [cell 35]
 # --- Section 9A. Repeated-seed confirmation for validation-selected final architecture ---
 # Purpose:
 #   The earlier repeated-seed block follows the configured primary backbone.
@@ -1906,7 +2599,7 @@ if model_eval is not None and CONFIG.get("run_final_selected_seed_confirmation",
 else:
     print("Final selected architecture repeated-seed confirmation skipped.")
 
-# %% [cell 34]
+# %% [cell 36]
 # --- Evaluate uncalibrated model ---
 
 if model_eval is not None:
@@ -1926,7 +2619,7 @@ if model_eval is not None:
 else:
     print("Skipped evaluation; no model loaded.")
 
-# %% [cell 35]
+# %% [cell 37]
 # --- Plot confusion matrix and per-class recall ---
 
 def plot_confusion(y_true, probs, out_path, title="Confusion matrix"):
@@ -1968,42 +2661,37 @@ if model_eval is not None:
 else:
     print("Skipped plots; no model loaded.")
 
-# %% [cell 37]
+# %% [cell 39]
 # --- Temperature scaling ---
-
-def fit_temperature_scaling(logits_val, y_val, max_iter=500, lr=0.05):
-    logits_tf = tf.constant(logits_val, dtype=tf.float32)
-    y_tf = tf.constant(y_val, dtype=tf.int32)
-    log_t = tf.Variable(0.0, dtype=tf.float32)
-    opt = tf.keras.optimizers.Adam(learning_rate=lr)
-
-    best_loss = np.inf
-    best_t = 1.0
-    for i in range(max_iter):
-        with tf.GradientTape() as tape:
-            t = tf.exp(log_t)
-            scaled = logits_tf / t
-            loss = tf.reduce_mean(tf.keras.losses.sparse_categorical_crossentropy(y_tf, scaled, from_logits=True))
-        grads = tape.gradient(loss, [log_t])
-        opt.apply_gradients(zip(grads, [log_t]))
-        loss_val = float(loss.numpy())
-        t_val = float(tf.exp(log_t).numpy())
-        if loss_val < best_loss:
-            best_loss = loss_val
-            best_t = t_val
-    return best_t, best_loss
+# fit_temperature_scaling is defined in the metric utilities cell so repeated-seed confirmation can use it earlier.
+# A single scalar temperature is fitted on the validation split only and then applied unchanged to test and ISIC2018 related-domain data.
 
 if model_eval is not None:
     T, val_nll_T = fit_temperature_scaling(val_logits, y_val)
     print("Fitted temperature:", T, "validation NLL:", val_nll_T)
+    val_probs_temp = softmax_np(val_logits, temperature=T)
     test_probs_temp = softmax_np(test_logits, temperature=T)
     temp_metrics = evaluate_probs(y_test, test_probs_temp, prefix="temp_")
     display(pd.DataFrame([raw_metrics, temp_metrics], index=["raw", "temperature_scaled"]).T)
-    pd.DataFrame([{"temperature": T, **temp_metrics}]).to_csv(RESULT_DIR / "test_metrics_temperature_scaled.csv", index=False)
+    pd.DataFrame([{"temperature": T, "validation_nll_temperature": val_nll_T, **temp_metrics}]).to_csv(RESULT_DIR / "test_metrics_temperature_scaled.csv", index=False)
+
+    calibration_params = {
+        "temperature": float(T),
+        "validation_nll_temperature": float(val_nll_T),
+        "temperature_fitted_on": "HAM10000 validation split only",
+        "applied_to": "held-out HAM10000 test and optional ISIC2018 related-domain test without refitting",
+        "ece_definition": "top-label expected calibration error",
+        "ece_bins": int(CONFIG["n_bins_ece"]),
+        "ece_binning": "equal-width bins over [0, 1]; final bin includes 1.0",
+        "scalar_temperature_limitation": "A single global scalar assumes uniform logit overconfidence and may not correct class-wise or subgroup calibration heterogeneity.",
+        "clinical_acceptability_note": CONFIG.get("ece_acceptability_note", "No universal clinical ECE threshold is assumed."),
+    }
+    with open(RESULT_DIR / "reviewer_temperature_scaling_and_ece_definition.json", "w") as f:
+        json.dump(calibration_params, f, indent=2)
 else:
     print("Skipped temperature scaling; no model loaded.")
 
-# %% [cell 38]
+# %% [cell 40]
 # --- Reliability diagrams ---
 
 def plot_reliability(y_true, probs, out_path, title="Reliability diagram", n_bins=15):
@@ -2029,7 +2717,7 @@ if model_eval is not None:
 else:
     print("Skipped reliability diagrams; no model loaded.")
 
-# %% [cell 39]
+# %% [cell 41]
 # --- Evaluate all trained model variants found in MODEL_DIR ---
 # This creates a paper-ready comparison table for backbone/loss/seed runs.
 # It uses the same validation-fitted temperature logic per model and evaluates once on the held-out test split.
@@ -2096,7 +2784,7 @@ if all_model_rows:
 else:
     print("No trained model variants found yet.")
 
-# %% [cell 41]
+# %% [cell 43]
 # --- Uncertainty scores and selective risk ---
 
 def predictive_entropy(probs, eps=1e-12):
@@ -2240,7 +2928,156 @@ if model_eval is not None:
 else:
     print("Skipped selective referral; no model loaded.")
 
-# %% [cell 42]
+# %% [cell 44]
+# --- Reviewer export: validation-chosen practical selective-referral operating point ---
+# This turns the retrospective risk-coverage curves into a concrete threshold rule.
+# The threshold is selected using validation labels only and then applied once to the held-out test split.
+
+
+def metrics_at_uncertainty_threshold(y_true, probs, uncertainty, threshold):
+    y_true = np.asarray(y_true).astype(int)
+    probs = np.asarray(probs)
+    uncertainty = np.asarray(uncertainty)
+    pred = probs.argmax(axis=1)
+    keep = uncertainty <= float(threshold)
+    n = len(y_true)
+    mel_idx = CLASS_TO_IDX["mel"]
+    mel_mask = y_true == mel_idx
+
+    if keep.sum() > 0:
+        selective_risk = 1.0 - accuracy_score(y_true[keep], pred[keep])
+        balanced_acc = balanced_accuracy_score(y_true[keep], pred[keep]) if len(np.unique(y_true[keep])) > 1 else np.nan
+        macro_f1 = f1_score(y_true[keep], pred[keep], average="macro", zero_division=0)
+    else:
+        selective_risk = np.nan
+        balanced_acc = np.nan
+        macro_f1 = np.nan
+
+    mel_auto = mel_mask & keep
+    mel_referred = mel_mask & (~keep)
+    mel_correct = mel_auto & (pred == mel_idx)
+    mel_wrong = mel_auto & (pred != mel_idx)
+
+    return {
+        "threshold": float(threshold),
+        "n_total": int(n),
+        "n_auto_classified": int(keep.sum()),
+        "n_referred": int((~keep).sum()),
+        "coverage": float(keep.mean()),
+        "referral_rate": float((~keep).mean()),
+        "selective_risk": float(selective_risk) if not pd.isna(selective_risk) else np.nan,
+        "balanced_accuracy_auto_classified": float(balanced_acc) if not pd.isna(balanced_acc) else np.nan,
+        "macro_f1_auto_classified": float(macro_f1) if not pd.isna(macro_f1) else np.nan,
+        "n_melanoma_total": int(mel_mask.sum()),
+        "n_melanoma_auto_total": int(mel_auto.sum()),
+        "n_melanoma_auto_correct": int(mel_correct.sum()),
+        "n_melanoma_auto_wrong": int(mel_wrong.sum()),
+        "n_melanoma_referred": int(mel_referred.sum()),
+        "melanoma_coverage": float(mel_auto.sum() / max(mel_mask.sum(), 1)),
+        "melanoma_auto_recall": float(mel_correct.sum() / max(mel_mask.sum(), 1)),
+    }
+
+
+def choose_threshold_on_validation(y_true_val, probs_val, uncertainty_val, target_risk=0.15, min_coverage=0.50):
+    thresholds = np.unique(np.asarray(uncertainty_val, dtype=float))
+    rows = []
+    for thr in thresholds:
+        m = metrics_at_uncertainty_threshold(y_true_val, probs_val, uncertainty_val, thr)
+        rows.append(m)
+    curve = pd.DataFrame(rows).sort_values(["coverage", "threshold"]).reset_index(drop=True)
+
+    eligible = curve[
+        (curve["coverage"] >= float(min_coverage))
+        & (curve["selective_risk"] <= float(target_risk))
+    ].copy()
+
+    if len(eligible):
+        chosen = eligible.sort_values(["coverage", "selective_risk"], ascending=[False, True]).iloc[0].to_dict()
+        chosen["target_risk_achieved_on_validation"] = True
+        chosen["selection_rule"] = "maximum_validation_coverage_with_selective_risk_at_or_below_target"
+    else:
+        fallback_pool = curve[curve["coverage"] >= float(min_coverage)].copy()
+        if fallback_pool.empty:
+            fallback_pool = curve.copy()
+        chosen = fallback_pool.sort_values(["selective_risk", "coverage"], ascending=[True, False]).iloc[0].to_dict()
+        chosen["target_risk_achieved_on_validation"] = False
+        chosen["selection_rule"] = "minimum_observed_validation_risk_fallback"
+
+    chosen["target_selective_risk"] = float(target_risk)
+    chosen["minimum_validation_coverage"] = float(min_coverage)
+    return chosen, curve
+
+
+if model_eval is not None and "val_probs_temp" in globals() and "test_probs_temp" in globals():
+    score_name = CONFIG.get("primary_uncertainty_score", "entropy")
+    val_score = uncertainty_scores(val_probs_temp)[score_name]
+    test_score = uncertainty_scores(test_probs_temp)[score_name]
+
+    chosen_val, validation_threshold_curve = choose_threshold_on_validation(
+        y_true_val=y_val,
+        probs_val=val_probs_temp,
+        uncertainty_val=val_score,
+        target_risk=CONFIG.get("referral_target_selective_risk", 0.15),
+        min_coverage=CONFIG.get("referral_minimum_validation_coverage", 0.50),
+    )
+
+    test_operating = metrics_at_uncertainty_threshold(
+        y_true=y_test,
+        probs=test_probs_temp,
+        uncertainty=test_score,
+        threshold=chosen_val["threshold"],
+    )
+
+    policy = {
+        "primary_uncertainty_score": score_name,
+        "threshold_selected_on": "HAM10000 validation split only",
+        "threshold_applied_to": "held-out HAM10000 test split",
+        "threshold_direction": "auto-classify if uncertainty_score <= threshold; refer otherwise",
+        "target_selective_risk": CONFIG.get("referral_target_selective_risk", 0.15),
+        "minimum_validation_coverage": CONFIG.get("referral_minimum_validation_coverage", 0.50),
+        "selection_rule": chosen_val["selection_rule"],
+        "target_risk_achieved_on_validation": bool(chosen_val["target_risk_achieved_on_validation"]),
+        "chosen_threshold": float(chosen_val["threshold"]),
+        "clinical_example_language": (
+            "For a local triage policy requiring the automatic arm to remain at or below the specified selective-risk target, "
+            "cases with entropy above the validation-chosen threshold are referred rather than automatically classified. "
+            "This is an example operating point, not a deployment recommendation."
+        ),
+    }
+
+    validation_threshold_curve.to_csv(RESULT_DIR / "selective_referral_validation_threshold_curve.csv", index=False)
+    pd.DataFrame([chosen_val]).to_csv(RESULT_DIR / "selective_referral_operating_point_validation_chosen.csv", index=False)
+    pd.DataFrame([test_operating]).to_csv(RESULT_DIR / "selective_referral_operating_point_test_results.csv", index=False)
+    with open(RESULT_DIR / "selective_referral_threshold_policy.json", "w") as f:
+        json.dump(policy, f, indent=2)
+
+    worked_example = f"""# Selective referral worked operating-point example
+
+This example is selected on the HAM10000 validation split only and then applied once to the held-out HAM10000 test split.
+
+Local constraint used for this example: automatic classifications should have selective risk <= {policy['target_selective_risk']:.3f} while retaining at least {policy['minimum_validation_coverage']:.3f} validation coverage.
+
+Primary uncertainty score: {score_name}.
+
+Decision rule: auto-classify if {score_name} <= {chosen_val['threshold']:.6f}; otherwise refer/abstain.
+
+Validation result at selected threshold: coverage {chosen_val['coverage']:.3f}, referral rate {chosen_val['referral_rate']:.3f}, selective risk {chosen_val['selective_risk']:.3f}.
+
+Held-out test result at the same threshold: coverage {test_operating['coverage']:.3f}, referral rate {test_operating['referral_rate']:.3f}, selective risk {test_operating['selective_risk']:.3f}.
+
+Melanoma counts on held-out test at this threshold: total melanoma {test_operating['n_melanoma_total']}, automatically classified melanoma {test_operating['n_melanoma_auto_total']}, automatically correct melanoma {test_operating['n_melanoma_auto_correct']}, automatically wrong melanoma {test_operating['n_melanoma_auto_wrong']}, referred melanoma {test_operating['n_melanoma_referred']}.
+
+This is a worked example for manuscript transparency, not a deployment recommendation. A clinical site would need to set the risk target prospectively and validate it locally.
+"""
+    (RESULT_DIR / "selective_referral_worked_example.md").write_text(worked_example)
+
+    display(pd.DataFrame([{"split": "validation_chosen", **chosen_val}, {"split": "test_applied", **test_operating}]))
+    print("Saved validation-chosen referral threshold policy:", RESULT_DIR / "selective_referral_threshold_policy.json")
+    print("Saved worked example:", RESULT_DIR / "selective_referral_worked_example.md")
+else:
+    print("Selective referral operating-point export skipped; run validation/test calibrated probabilities first.")
+
+# %% [cell 45]
 # --- Plot risk-coverage and referral curves ---
 
 def plot_selective_curves(curves, out_path):
@@ -2275,7 +3112,7 @@ if model_eval is not None:
 else:
     print("Skipped selective plots; no model loaded.")
 
-# %% [cell 44]
+# %% [cell 47]
 import numpy as np
 import pandas as pd
 
@@ -2345,10 +3182,37 @@ if model_eval is not None:
     gap_df = pd.DataFrame(gap_rows)
     display(gap_df)
     gap_df.to_csv(RESULT_DIR / "internal_subgroup_gap_summary.csv", index=False)
+
+
+    # Reviewer-facing sex subgroup interpretation note.
+    sex_rows = subgroup_results.loc[subgroup_results["subgroup_variable"] == "sex"].copy()
+    note_lines = [
+        "# Sex subgroup calibration and discrimination note",
+        "",
+        "This note is generated from the internal HAM10000 test split. It is descriptive only and should not be interpreted causally.",
+    ]
+    if len(sex_rows):
+        note_lines.append("")
+        for _, row in sex_rows.sort_values("subgroup").iterrows():
+            note_lines.append(
+                f"- {row['subgroup']}: n={int(row['n'])}, balanced accuracy={row.get('balanced_accuracy', np.nan):.3f}, "
+                f"macro-F1={row.get('macro_f1', np.nan):.3f}, ECE={row.get('ece', np.nan):.3f}, "
+                f"melanoma recall={row.get('melanoma_recall', np.nan) if not pd.isna(row.get('melanoma_recall', np.nan)) else float('nan'):.3f}."
+            )
+        note_lines.append("")
+        note_lines.append(
+            "If one sex subgroup shows better discrimination but worse calibration, report this as evidence that global scalar temperature scaling may not correct subgroup-specific calibration heterogeneity. "
+            "The notebook does not infer a biological cause, because HAM10000 subgroup variables are observational and confounded by acquisition site, diagnosis mix, lesion location, and sample size."
+        )
+    else:
+        note_lines.append("No sex subgroup rows met the minimum subgroup size threshold in this run.")
+
+    (RESULT_DIR / "subgroup_sex_calibration_discrimination_note.md").write_text("\n".join(note_lines))
+    print("Saved:", RESULT_DIR / "subgroup_sex_calibration_discrimination_note.md")
 else:
     print("Skipped subgroup analysis; no model loaded.")
 
-# %% [cell 45]
+# %% [cell 48]
 # --- Subgroup heatmap-style plot with matplotlib ---
 
 if model_eval is not None and 'subgroup_results' in globals() and len(subgroup_results):
@@ -2372,7 +3236,7 @@ if model_eval is not None and 'subgroup_results' in globals() and len(subgroup_r
 else:
     print("Skipped subgroup plots.")
 
-# %% [cell 46]
+# %% [cell 49]
 # --- Section 12A. Per-subgroup class counts ---
 # Purpose:
 #   Report the denominator behind subgroup metrics, especially melanoma, df, vasc, and akiec.
@@ -2451,7 +3315,7 @@ if model_eval is not None:
 else:
     print("Skipped subgroup class counts; no model loaded.")
 
-# %% [cell 47]
+# %% [cell 50]
 # --- Section 12B. Selective referral by subgroup ---
 # Purpose:
 #   For each subgroup, report how many cases would be automatically classified
@@ -2707,7 +3571,7 @@ if model_eval is not None:
 else:
     print("Skipped subgroup selective referral; no model loaded.")
 
-# %% [cell 49]
+# %% [cell 52]
 # --- Bootstrap confidence intervals ---
 
 def bootstrap_ci_metrics(y_true, probs, n_reps=1000, seed=42):
@@ -2746,7 +3610,7 @@ if model_eval is not None and RUN_BOOTSTRAP:
 else:
     print("Bootstrap skipped. Set CONFIG['run_bootstrap']=True for final reporting.")
 
-# %% [cell 50]
+# %% [cell 53]
 # --- Section 13A. Bootstrap confidence intervals for subgroup metrics ---
 # Purpose:
 #   Quantify uncertainty for subgroup balanced accuracy, macro-F1, Brier score, ECE,
@@ -2935,7 +3799,7 @@ if model_eval is not None and CONFIG["run_bootstrap"]:
 else:
     print("Subgroup bootstrap skipped. Set CONFIG['run_bootstrap']=True and load a model.")
 
-# %% [cell 52]
+# %% [cell 55]
 # --- MC Dropout inference: cached CPU sensitivity analysis ---
 # MC Dropout is computationally expensive because it repeats inference many times.
 # This version caches image batches once, then reuses them for all stochastic passes.
@@ -3085,7 +3949,7 @@ if model_eval is not None and CONFIG["run_mc_dropout"]:
 else:
     print("MC Dropout skipped. Set CONFIG['run_mc_dropout']=True for best model.")
 
-# %% [cell 54]
+# %% [cell 57]
 # --- Train and evaluate exploratory clean multimodal late-fusion ablation ---
 # Tests whether deployable metadata change classification, calibration, or subgroup stability.
 #
@@ -3098,6 +3962,9 @@ else:
 #   The primary model is selected among image-only candidates. This multimodal result is
 #   a secondary/exploratory ablation unless CONFIG["include_multimodal_in_model_selection"]
 #   is deliberately changed and the model-selection cell is rerun.
+#
+# Reviewer guard:
+#   The ablation is matched to the validation-selected primary backbone/loss whenever possible.
 
 RUN_MULTIMODAL_ABLATION = CONFIG["run_multimodal_ablation"]
 
@@ -3109,13 +3976,29 @@ if RUN_MULTIMODAL_ABLATION:
     tf.keras.backend.clear_session()
     gc.collect()
 
-    multimodal_tag = f"{CONFIG['backbone']}_multimodal_cleanmeta_seed{CONFIG['seed']}_{CONFIG['loss_type']}"
+    if "model_eval" in globals() and model_eval is not None and "selected_model_path" in globals() and selected_model_path is not None:
+        selected_run_tag_for_ablation = Path(selected_model_path).parent.name
+        ablation_backbone = infer_backbone_from_run_tag(selected_run_tag_for_ablation)
+        ablation_loss = infer_loss_type_from_run_tag(selected_run_tag_for_ablation)
+        if ablation_backbone == "unknown":
+            ablation_backbone = CONFIG["backbone"]
+            ablation_loss = CONFIG["loss_type"]
+            ablation_matching_note = "could_not_infer_selected_model; used CONFIG fallback"
+        else:
+            ablation_matching_note = "matched_to_validation_selected_image_only_model"
+    else:
+        selected_run_tag_for_ablation = "not_available"
+        ablation_backbone = CONFIG["backbone"]
+        ablation_loss = CONFIG["loss_type"]
+        ablation_matching_note = "used_CONFIG_fallback_no_selected_model_loaded"
+
+    multimodal_tag = f"{ablation_backbone}_multimodal_cleanmeta_seed{CONFIG['seed']}_{ablation_loss}"
 
     multimodal_model, multimodal_dir, multimodal_runtime = train_one_model(
-        CONFIG["backbone"],
+        ablation_backbone,
         use_metadata=True,
         seed=CONFIG["seed"],
-        loss_type=CONFIG["loss_type"],
+        loss_type=ablation_loss,
         run_tag=multimodal_tag,
     )
 
@@ -3131,6 +4014,10 @@ if RUN_MULTIMODAL_ABLATION:
     multimodal_row = {
         "ablation_scope": "secondary_exploratory_clean_metadata",
         "selection_status": "not_used_for_primary_test_model_selection",
+        "matching_note": ablation_matching_note,
+        "matched_selected_run_tag": selected_run_tag_for_ablation,
+        "ablation_backbone": ablation_backbone,
+        "ablation_loss_type": ablation_loss,
         "metadata_inputs": ",".join(META_NUMERIC_COLS + META_CATEGORICAL_COLS),
         "excluded_from_inputs": "dx_type",
         "temperature": mm_T,
@@ -3147,23 +4034,25 @@ if RUN_MULTIMODAL_ABLATION:
     )
 
     print("Saved clean multimodal ablation results.")
+    print("Ablation backbone/loss:", ablation_backbone, ablation_loss)
     print("Metadata inputs:", META_NUMERIC_COLS + META_CATEGORICAL_COLS)
     print("Excluded from inputs: dx_type")
 else:
     print("Multimodal ablation skipped. Set CONFIG['run_multimodal_ablation']=True when baseline is stable.")
 
-# %% [cell 56]
-# --- External ISIC2018 test-set dataframe builder ---
+# %% [cell 59]
+# --- Related-domain ISIC2018 Task 3 test-set dataframe builder ---
 # Supports both:
 #   1) HAM10000-style long format with columns: image_id, dx
 #   2) Original ISIC one-hot format with columns: MEL, NV, BCC, AKIEC, BKL, DF, VASC
 #
 # Output:
-#   external_isic2018_df
+#   external_isic2018_df  # variable name retained for backward compatibility
 #
 # Important:
-#   This cell only builds the external dataframe.
-#   It does not train or tune anything on the external set.
+#   This cell only builds the related-domain dataframe.
+#   It does not train, tune, refit temperature, or choose referral thresholds on ISIC2018.
+#   In the manuscript, describe this as related-domain robustness, not independent external validation.
 
 ISIC2018_LABEL_MAP = {
     "MEL": "mel",
@@ -3175,38 +4064,106 @@ ISIC2018_LABEL_MAP = {
     "VASC": "vasc",
 }
 
-def find_isic2018_groundtruth(root):
-    """Find ISIC2018 Task 3 test ground-truth CSV."""
-    root = Path(root)
-    cands = []
 
-    for p in root.rglob("*"):
-        if not p.is_file():
+def unique_existing_roots(*roots):
+    seen = set()
+    out = []
+    for root in roots:
+        if root is None:
             continue
+        p = Path(root)
+        try:
+            p_resolved = p.resolve()
+        except Exception:
+            p_resolved = p
+        if p.exists() and str(p_resolved) not in seen:
+            seen.add(str(p_resolved))
+            out.append(p)
+    return out
 
-        name = p.name.lower()
 
-        if (
-            "isic2018_task3_test_groundtruth" in name
-            or "isic2018_task3_test" in name and "groundtruth" in name
-            or "task3_test_groundtruth" in name
-        ):
-            cands.append(p)
+ISIC2018_SEARCH_ROOTS = unique_existing_roots(
+    Path(CONFIG.get("isic2018_download_dir", "/content/ISIC2018")),
+    globals().get("ISIC2018_DIR", None),
+    RAW_DIR,
+)
 
+
+def is_isic2018_test_context(path, dedicated_root=None):
+    """True for paths that plausibly belong to the official ISIC2018 Task 3 test files.
+
+    This deliberately avoids using generic HAM10000 images from RAW_DIR as ISIC images.
+    """
+    p = Path(path)
+    s = str(p).lower().replace("\\", "/")
+    if dedicated_root is not None:
+        try:
+            if Path(dedicated_root).resolve() in p.resolve().parents or p.resolve() == Path(dedicated_root).resolve():
+                return True
+        except Exception:
+            pass
+    return (
+        "isic2018" in s
+        and "task3" in s
+        and "test" in s
+        and ("input" in s or "groundtruth" in s or "ground_truth" in s)
+    )
+
+
+def find_isic2018_groundtruth(roots):
+    """Find official ISIC2018 Task 3 test ground-truth CSV across allowed roots."""
+    cands = []
+    for root in unique_existing_roots(*roots):
+        for p in root.rglob("*"):
+            if not p.is_file() or p.suffix.lower() != ".csv":
+                continue
+            name = p.name.lower()
+            full = str(p).lower().replace("\\", "/")
+            is_test_gt = (
+                "isic2018_task3_test_groundtruth" in name
+                or ("task3" in full and "test" in full and ("groundtruth" in full or "ground_truth" in full))
+            )
+            if is_test_gt:
+                cands.append(p)
     return sorted(cands, key=lambda p: len(str(p)))
 
 
-def build_image_stem_map(root):
-    """Map image stem -> image file path across extracted raw directory."""
-    root = Path(root)
+def build_isic2018_image_stem_map(roots):
+    """Map image stem -> image file path from ISIC2018 test input locations only."""
     img_map = {}
-
-    for p in root.rglob("*"):
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
-            # If duplicates exist, keep the first discovered path.
-            img_map.setdefault(p.stem, str(p))
-
+    dedicated_download_root = Path(CONFIG.get("isic2018_download_dir", "/content/ISIC2018"))
+    for root in unique_existing_roots(*roots):
+        for p in root.rglob("*"):
+            if not p.is_file() or p.suffix.lower() not in IMAGE_EXTS:
+                continue
+            # If searching RAW_DIR, require an ISIC2018 Task 3 test path marker. If searching the
+            # dedicated download root, all images under it are considered ISIC2018 candidates.
+            in_dedicated = False
+            try:
+                in_dedicated = dedicated_download_root.resolve() in p.resolve().parents
+            except Exception:
+                pass
+            if in_dedicated or is_isic2018_test_context(p):
+                img_map.setdefault(p.stem, str(p))
     return img_map
+
+
+def write_isic2018_status(status, **kwargs):
+    payload = {
+        "analysis_name": "ISIC2018 Task 3 related-domain robustness",
+        "status": status,
+        "search_roots": [str(p) for p in ISIC2018_SEARCH_ROOTS],
+        "required_files": {
+            "test_input": "ISIC2018_Task3_Test_Input.zip",
+            "test_ground_truth": "ISIC2018_Task3_Test_GroundTruth.zip",
+        },
+        "download_urls": globals().get("ISIC2018_TASK3_TEST_FILES", {}),
+        "manuscript_framing": "related-domain robustness only; not independent external validation",
+    }
+    payload.update(kwargs)
+    with open(RESULT_DIR / "isic2018_related_domain_status.json", "w") as f:
+        json.dump(payload, f, indent=2)
+    return payload
 
 
 def normalise_dx_label(x):
@@ -3226,13 +4183,19 @@ def normalise_dx_label(x):
     # Some files may use alternative spelling.
     alias = {
         "melanoma": "mel",
+        "melanocytic nevus": "nv",
         "nevus": "nv",
         "nevi": "nv",
         "basal cell carcinoma": "bcc",
         "actinic keratosis": "akiec",
         "actinic keratoses": "akiec",
+        "bowen's disease": "akiec",
+        "intraepithelial carcinoma": "akiec",
         "benign keratosis": "bkl",
         "benign keratosis-like lesions": "bkl",
+        "solar lentigo": "bkl",
+        "seborrheic keratosis": "bkl",
+        "lichen planus-like keratosis": "bkl",
         "dermatofibroma": "df",
         "vascular lesion": "vasc",
         "vascular lesions": "vasc",
@@ -3247,8 +4210,9 @@ def infer_dx_from_groundtruth(gt):
 
     # Case 1: already has dx column.
     if "dx" in gt.columns:
+        gt["dx_original"] = gt["dx"]
         gt["dx"] = gt["dx"].apply(normalise_dx_label)
-        return gt
+        return gt, "direct_dx_column"
 
     # Case 2: one-hot encoded columns.
     onehot_cols = [c for c in gt.columns if c.upper() in ISIC2018_LABEL_MAP]
@@ -3260,13 +4224,15 @@ def infer_dx_from_groundtruth(gt):
             f"Found columns: {gt.columns.tolist()}"
         )
 
-    # Convert one-hot row to diagnosis.
     onehot_df = gt[onehot_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+    row_sums = onehot_df.sum(axis=1)
+    non_onehot_rows = int(((row_sums - 1.0).abs() > 1e-6).sum())
+    if non_onehot_rows:
+        print("Warning: some ISIC2018 ground-truth rows do not sum to exactly 1 across one-hot diagnosis columns:", non_onehot_rows)
 
     gt["dx_original"] = onehot_df.idxmax(axis=1)
     gt["dx"] = gt["dx_original"].apply(normalise_dx_label)
-
-    return gt
+    return gt, "one_hot_columns_idxmax"
 
 
 def infer_image_id_column(gt):
@@ -3277,29 +4243,35 @@ def infer_image_id_column(gt):
         if col in gt.columns:
             return col
 
-    # Fallback: if no obvious image column, use the first column.
-    # But this is less safe, so we print a warning.
     print("Warning: could not find a standard image-id column. Using first column:", gt.columns[0])
     return gt.columns[0]
 
 
-def build_external_isic2018_df(root):
-    """Build external ISIC2018 dataframe compatible with notebook evaluation functions."""
-    root = Path(root)
+def build_external_isic2018_df(roots):
+    """Build related-domain ISIC2018 dataframe compatible with notebook evaluation functions."""
+    roots = unique_existing_roots(*roots)
+    print("ISIC2018 search roots:", [str(r) for r in roots])
 
-    gt_cands = find_isic2018_groundtruth(root)
+    gt_cands = find_isic2018_groundtruth(roots)
     if not gt_cands:
-        print("No ISIC2018 Task 3 ground-truth CSV found.")
+        status = write_isic2018_status(
+            "not_found",
+            reason="No official ISIC2018 Task 3 test ground-truth CSV found in the search roots.",
+            next_action="Download and extract ISIC2018_Task3_Test_Input.zip and ISIC2018_Task3_Test_GroundTruth.zip under /content/ISIC2018 or include them in the input archive.",
+        )
+        print("No ISIC2018 Task 3 test ground-truth CSV found.")
+        print("Expected official files: ISIC2018_Task3_Test_Input.zip and ISIC2018_Task3_Test_GroundTruth.zip.")
+        print("Status saved:", RESULT_DIR / "isic2018_related_domain_status.json")
         return None
 
     gt_path = gt_cands[0]
-    print("Using ISIC2018 ground truth:", gt_path)
+    print("Using ISIC2018 Task 3 test ground truth:", gt_path)
 
-    gt = pd.read_csv(gt_path)
-    print("ISIC2018 GT columns:", gt.columns.tolist())
-    display(gt.head())
+    gt_raw = pd.read_csv(gt_path)
+    print("ISIC2018 GT columns:", gt_raw.columns.tolist())
+    display(gt_raw.head())
 
-    gt = infer_dx_from_groundtruth(gt)
+    gt, label_mapping_procedure = infer_dx_from_groundtruth(gt_raw)
 
     # Keep only labels that match the current 7-class classifier.
     gt["dx"] = gt["dx"].astype(str).str.lower()
@@ -3309,46 +4281,68 @@ def build_external_isic2018_df(root):
         print("Warning: dropping unsupported diagnosis labels:", unknown_dx)
 
     gt = gt.loc[gt["dx"].isin(CLASS_NAMES)].copy()
+    n_after_label_filter = int(len(gt))
 
     if gt.empty:
+        write_isic2018_status(
+            "label_mapping_failed",
+            ground_truth_path=str(gt_path),
+            n_ground_truth_rows_initial=int(len(gt_raw)),
+            unknown_dx=unknown_dx,
+        )
         raise ValueError("After label filtering, no ISIC2018 rows matched CLASS_NAMES.")
 
     id_col = infer_image_id_column(gt)
 
-    # Important:
-    # In your file, image_id is the correct column.
-    # Do NOT accidentally use lesion_id, because HAMTEST_... is not the image filename stem.
-    gt["image_id"] = gt[id_col].astype(str).str.replace(".jpg", "", regex=False).str.replace(".jpeg", "", regex=False).str.replace(".png", "", regex=False)
+    gt["image_id"] = (
+        gt[id_col].astype(str)
+        .str.replace(".jpg", "", regex=False)
+        .str.replace(".jpeg", "", regex=False)
+        .str.replace(".png", "", regex=False)
+    )
 
     gt["label"] = gt["dx"].map(CLASS_TO_IDX)
 
     if gt["label"].isna().any():
         bad = gt.loc[gt["label"].isna(), "dx"].unique()
+        write_isic2018_status("label_index_mapping_failed", bad_dx=[str(x) for x in bad])
         raise ValueError(f"Some dx values could not be mapped to CLASS_TO_IDX: {bad}")
 
     gt["label"] = gt["label"].astype(int)
 
-    img_map = build_image_stem_map(root)
-    print("Number of image files discovered under RAW_DIR:", len(img_map))
+    img_map = build_isic2018_image_stem_map(roots)
+    print("Number of ISIC2018 test image files discovered under allowed roots:", len(img_map))
 
     gt["image_path"] = gt["image_id"].map(img_map)
 
-    missing_img = gt["image_path"].isna().sum()
+    missing_image_ids = gt.loc[gt["image_path"].isna(), "image_id"].head(100).astype(str).tolist()
+    missing_img = int(gt["image_path"].isna().sum())
     if missing_img > 0:
-        print(f"Warning: {missing_img} ISIC2018 rows did not match an extracted image file.")
-        print("Examples of missing image_ids:", gt.loc[gt["image_path"].isna(), "image_id"].head(10).tolist())
+        print(f"Warning: {missing_img} ISIC2018 rows did not match an extracted official test image file.")
+        print("Examples of missing image_ids:", missing_image_ids[:10])
 
     gt = gt.loc[gt["image_path"].notna()].copy().reset_index(drop=True)
 
     if gt.empty:
+        write_isic2018_status(
+            "groundtruth_found_but_images_missing",
+            ground_truth_path=str(gt_path),
+            n_after_label_filter=n_after_label_filter,
+            n_missing_images_after_label_filter=missing_img,
+            missing_image_id_examples=missing_image_ids[:20],
+        )
         raise FileNotFoundError(
-            "Ground-truth CSV was found, but no image_id values matched extracted image files. "
-            "Check whether the ISIC2018 test images were extracted under RAW_DIR."
+            "Ground-truth CSV was found, but no image_id values matched extracted official ISIC2018 test image files. "
+            "Check whether ISIC2018_Task3_Test_Input.zip was extracted under /content/ISIC2018 or an ISIC2018-marked folder in RAW_DIR."
         )
 
-    # Preserve metadata if present; otherwise create safe placeholders.
-    if "lesion_id" not in gt.columns:
-        gt["lesion_id"] = gt["image_id"]
+    # Preserve lesion IDs if genuinely present. Do not silently use image_id as a lesion ID;
+    # the overlap checker needs to distinguish true lesion-level IDs from missing metadata.
+    if "lesion_id" in gt.columns and gt["lesion_id"].notna().any():
+        lesion_id_source = "provided_in_groundtruth"
+    else:
+        gt["lesion_id"] = np.nan
+        lesion_id_source = "not_available_in_groundtruth"
 
     if "age" not in gt.columns:
         gt["age"] = np.nan
@@ -3360,12 +4354,12 @@ def build_external_isic2018_df(root):
         gt["localization"] = "missing"
 
     if "dx_type" not in gt.columns:
-        gt["dx_type"] = "external_isic2018"
+        gt["dx_type"] = "isic2018_test_ground_truth"
 
     # Clean metadata types.
     gt["sex"] = gt["sex"].fillna("missing").astype(str).str.lower()
     gt["localization"] = gt["localization"].fillna("missing").astype(str).str.lower()
-    gt["dx_type"] = gt["dx_type"].fillna("external_isic2018").astype(str).str.lower()
+    gt["dx_type"] = gt["dx_type"].fillna("isic2018_test_ground_truth").astype(str).str.lower()
 
     out_cols = [
         "lesion_id",
@@ -3381,29 +4375,66 @@ def build_external_isic2018_df(root):
 
     external_df = gt[out_cols].copy()
 
-    print("External ISIC2018 rows with matched images:", len(external_df))
-    print("External ISIC2018 class distribution:")
-    display(external_df["dx"].value_counts().reindex(CLASS_NAMES).fillna(0).astype(int))
+    class_distribution = external_df["dx"].value_counts().reindex(CLASS_NAMES).fillna(0).astype(int)
+
+    subset_manifest = {
+        "analysis_name": "ISIC2018 Task 3 related-domain robustness",
+        "subset_used": "Official ISIC 2018 Challenge Task 3 Test Input images with Task 3 Test GroundTruth labels",
+        "ground_truth_path": str(gt_path),
+        "search_roots": [str(r) for r in roots],
+        "n_ground_truth_rows_initial": int(len(gt_raw)),
+        "n_after_label_filter": n_after_label_filter,
+        "n_rows_with_matched_images": int(len(external_df)),
+        "n_missing_images_after_label_filter": missing_img,
+        "missing_image_id_examples": missing_image_ids[:20],
+        "image_id_column_used": id_col,
+        "label_mapping_procedure": label_mapping_procedure,
+        "label_mapping": ISIC2018_LABEL_MAP,
+        "class_order": CLASS_NAMES,
+        "class_distribution": {cls: int(class_distribution.loc[cls]) for cls in CLASS_NAMES},
+        "lesion_id_source": lesion_id_source,
+        "lesion_level_overlap_assessability": "assessable only if lesion_id_source is provided_in_groundtruth",
+        "evaluation_protocol": "No training, model selection, temperature refitting, threshold selection, or hyperparameter tuning on ISIC2018 labels.",
+        "framing": "related-domain robustness only; not independent external clinical validation",
+    }
+
+    with open(RESULT_DIR / "isic2018_related_domain_subset_manifest.json", "w") as f:
+        json.dump(subset_manifest, f, indent=2)
+    with open(RESULT_DIR / "isic2018_related_domain_status.json", "w") as f:
+        json.dump({"status": "ready", **subset_manifest}, f, indent=2)
+    pd.DataFrame([{"class": cls, "n": int(class_distribution.loc[cls])} for cls in CLASS_NAMES]).to_csv(
+        RESULT_DIR / "isic2018_related_domain_class_distribution.csv",
+        index=False,
+    )
+
+    external_df.attrs["subset_manifest"] = subset_manifest
+    external_df.attrs["lesion_id_source"] = lesion_id_source
+
+    print("Related-domain ISIC2018 rows with matched images:", len(external_df))
+    print("Related-domain ISIC2018 class distribution:")
+    display(class_distribution)
+    print("Saved:", RESULT_DIR / "isic2018_related_domain_subset_manifest.json")
 
     return external_df
 
 
 external_isic2018_df = None
 
-if CONFIG["run_isic2018_external_if_found"]:
-    external_isic2018_df = build_external_isic2018_df(RAW_DIR)
+if CONFIG.get("run_isic2018_related_domain_if_found", CONFIG.get("run_isic2018_external_if_found", True)):
+    external_isic2018_df = build_external_isic2018_df(ISIC2018_SEARCH_ROOTS)
 
     if external_isic2018_df is None:
-        print("No ISIC2018 external test set found in zip.")
+        print("No ISIC2018 related-domain test set found. The internal HAM10000 analysis can still run.")
     else:
-        print("External ISIC2018 dataframe ready.")
+        print("ISIC2018 related-domain dataframe ready.")
         display(external_isic2018_df.head())
 
 else:
-    print("External evaluation disabled.")
+    write_isic2018_status("disabled_by_config")
+    print("Related-domain ISIC2018 evaluation disabled.")
 
-# %% [cell 57]
-# --- Evaluate external ISIC2018 if available ---
+# %% [cell 60]
+# --- Evaluate related-domain ISIC2018 Task 3 if available ---
 
 if model_eval is not None and external_isic2018_df is not None and len(external_isic2018_df) > 0:
     X_meta_ext = meta_pre.transform(external_isic2018_df)
@@ -3413,17 +4444,18 @@ if model_eval is not None and external_isic2018_df is not None and len(external_
         use_metadata=model_uses_metadata(model_eval)
     )
     ext_logits, y_ext = collect_logits(model_eval, ext_ds)
-    # Use temperature fitted on HAM10000 validation set, not external labels.
+    # Use temperature fitted on HAM10000 validation set, not external/related-domain labels.
     ext_probs = softmax_np(ext_logits, temperature=T if "T" in globals() else 1.0)
-    ext_metrics = evaluate_probs(y_ext, ext_probs, prefix="isic2018_external_")
+    ext_metrics = evaluate_probs(y_ext, ext_probs, prefix="isic2018_related_domain_")
     display(pd.DataFrame([ext_metrics]).T.rename(columns={0: "value"}))
-    pd.DataFrame([ext_metrics]).to_csv(RESULT_DIR / "isic2018_external_metrics.csv", index=False)
-    plot_confusion(y_ext, ext_probs, FIG_DIR / "isic2018_external_confusion_matrix.png", "ISIC2018 external confusion matrix")
-    plot_reliability(y_ext, ext_probs, FIG_DIR / "isic2018_external_reliability.png", "ISIC2018 external reliability", CONFIG["n_bins_ece"])
+    pd.DataFrame([ext_metrics]).to_csv(RESULT_DIR / "isic2018_related_domain_metrics.csv", index=False)
+    plot_confusion(y_ext, ext_probs, FIG_DIR / "isic2018_related_domain_confusion_matrix.png", "ISIC2018 related-domain confusion matrix")
+    plot_reliability(y_ext, ext_probs, FIG_DIR / "isic2018_related_domain_reliability.png", "ISIC2018 related-domain reliability", CONFIG["n_bins_ece"])
+    print("ISIC2018 result saved as related-domain robustness, not independent external validation.")
 else:
-    print("External ISIC2018 evaluation skipped.")
+    print("Related-domain ISIC2018 evaluation skipped.")
 
-# %% [cell 59]
+# %% [cell 62]
 # --- Stress-test dataset construction ---
 # Uses the same CPU-only Keras Sequence/PIL backend as the main evaluation pipeline.
 
@@ -3526,7 +4558,7 @@ if model_eval is not None and CONFIG["run_stress_tests"]:
 else:
     print("Stress tests skipped.")
 
-# %% [cell 60]
+# %% [cell 63]
 # --- Stress-test plot ---
 
 if 'stress_df' in globals() and len(stress_df):
@@ -3543,7 +4575,7 @@ if 'stress_df' in globals() and len(stress_df):
 else:
     print("No stress-test results to plot.")
 
-# %% [cell 62]
+# %% [cell 65]
 # --- Grad-CAM helper ---
 # Qualitative only: use to audit selected high-uncertainty or misclassified cases.
 # This cell is non-fatal. If the model architecture prevents Grad-CAM extraction, it records the issue and continues.
@@ -3654,7 +4686,7 @@ if model_eval is not None and RUN_GRADCAM_EXAMPLE:
 else:
     print("Grad-CAM skipped. Set CONFIG['run_gradcam_example']=True for qualitative review.")
 
-# %% [cell 64]
+# %% [cell 67]
 # --- Optional TFLite export: safer image-only wrapper ---
 
 if model_eval is not None and CONFIG["run_tflite_export"]:
@@ -3714,7 +4746,7 @@ if model_eval is not None and CONFIG["run_tflite_export"]:
 else:
     print("TFLite export skipped.")
 
-# %% [cell 65]
+# %% [cell 68]
 # --- Methodological deployment verification ---
 # This cell checks that the critical publication-safety fixes are active in the notebook run.
 
@@ -3724,7 +4756,9 @@ verification = {
     "primary_selection_image_only": CONFIG.get("main_model_selection_image_only", True),
     "multimodal_excluded_from_primary_selection": not CONFIG.get("include_multimodal_in_model_selection", False),
     "final_selected_seed_confirmation_enabled": CONFIG.get("run_final_selected_seed_confirmation", False),
+    "isic2018_framed_as_related_domain": True,
     "tflite_export_image_only_wrapper": True,
+    "deployment_feasibility_not_claimed_from_export_alone": True,
 }
 
 if "selective_summary" in globals() and isinstance(selective_summary, pd.DataFrame) and "auto_sensitivity_for_class" in selective_summary.columns:
@@ -3736,6 +4770,10 @@ if "mc_summary" in globals() and isinstance(mc_summary, pd.DataFrame) and "auto_
     verification["mc_selective_sensitivity_bounded_by_1"] = mc_summary["auto_sensitivity_for_class"].dropna().le(1.0 + 1e-9).all()
 else:
     verification["mc_selective_sensitivity_bounded_by_1"] = "not_yet_run"
+
+verification["validation_chosen_referral_threshold_exported"] = (RESULT_DIR / "selective_referral_threshold_policy.json").exists()
+verification["cross_dataset_overlap_summary_exported"] = (RESULT_DIR / "reviewer_cross_dataset_overlap_summary.csv").exists()
+verification["tflite_postquantization_performance_exported"] = (RESULT_DIR / "reviewer_tflite_postquantization_performance.csv").exists()
 
 verification_df = pd.DataFrame([
     {"check": k, "status": v} for k, v in verification.items()
@@ -3749,10 +4787,12 @@ assert verification["dx_type_available_for_subgroup_analysis"] is True
 assert verification["primary_selection_image_only"] is True
 assert verification["multimodal_excluded_from_primary_selection"] is True
 assert verification["final_selected_seed_confirmation_enabled"] is True
+assert verification["isic2018_framed_as_related_domain"] is True
+assert verification["deployment_feasibility_not_claimed_from_export_alone"] is True
 
 print("Methodological deployment verification passed.")
 
-# %% [cell 67]
+# %% [cell 70]
 # --- Manifest of outputs ---
 
 manifest = {
@@ -3777,3 +4817,751 @@ for p in manifest["figure_files"]:
 print("Results:")
 for p in manifest["result_files"]:
     print(" -", p)
+
+# %% [cell 72]
+# --- Export manuscript revision notes and code availability checklist ---
+
+revision_notes = f"""
+# Reviewer and editor revision notes
+
+## Revised title
+Calibrated Selective Referral for Skin Lesion AI on HAM10000
+
+## Code availability statement template
+The full analysis code, exact train/validation/test split files, configuration file, model-selection table, training histories, runtime logs, result tables, and figure-generation scripts are available at: [insert DOI repository link, e.g. Zenodo DOI]. The repository should include this notebook and/or equivalent scripts, `splits/`, `results/`, `figures/`, `config.json`, `manifest.json`, `reviewer_editor_compliance_matrix.csv`, and environment details.
+
+## Cautious interpretation language
+This model is evaluated as a triage-support candidate, not as an autonomous diagnostic system. High multiclass AUROC should not be interpreted as adequate clinical safety because macro-F1 and melanoma-specific F1/precision remain much lower at the selected operating threshold. Low melanoma precision means that predicted melanoma cases require clinician review and the selective-referral mechanism should be interpreted as a safety-oriented abstention aid.
+
+## Calibration language
+ECE is computed as top-label ECE using {CONFIG['n_bins_ece']} equal-width bins over [0, 1]. MCE is the maximum non-empty-bin absolute calibration gap. A single temperature parameter is fitted on validation logits only. This scalar correction may not remove class-wise or subgroup calibration heterogeneity.
+
+## Related-domain robustness language
+The ISIC2018 Task 3 test analysis uses the official ISIC2018_Task3_Test_Input.zip images and ISIC2018_Task3_Test_GroundTruth.zip labels if available. Because of overlap in acquisition ecosystem and challenge provenance with HAM10000, it should be called related-domain robustness rather than independent external validation.
+
+## Deployment language
+TFLite export is reported only as a technical conversion step. Deployment feasibility is not claimed unless latency, approximate memory, numerical equivalence, and post-quantization performance are reported and then validated on intended target hardware and in a clinical workflow.
+""".strip()
+
+(RESULT_DIR / "reviewer_manuscript_revision_notes.md").write_text(revision_notes)
+print("Saved:", RESULT_DIR / "reviewer_manuscript_revision_notes.md")
+
+# %% [cell 74]
+
+# --- Reviewer export 1: class-wise metrics and confusion matrices ---
+from sklearn.metrics import confusion_matrix
+
+def export_confusion_and_classwise(y_true, probs, prefix, out_dir=RESULT_DIR, fig_dir=FIG_DIR):
+    """Export class-wise metrics and a count confusion matrix for reviewer reporting."""
+    pred = np.asarray(probs).argmax(axis=1)
+    cm = confusion_matrix(y_true, pred, labels=np.arange(N_CLASSES))
+    cm_df = pd.DataFrame(cm, index=[f"true_{c}" for c in CLASS_NAMES], columns=[f"pred_{c}" for c in CLASS_NAMES])
+    cm_df.to_csv(out_dir / f"{prefix}_confusion_matrix_counts.csv")
+    pct = per_class_table(y_true, probs)
+    pct.to_csv(out_dir / f"{prefix}_per_class_precision_recall_f1.csv", index=False)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    cm_norm = cm / np.maximum(cm.sum(axis=1, keepdims=True), 1)
+    im = ax.imshow(cm_norm, aspect="auto")
+    ax.set_xticks(np.arange(N_CLASSES)); ax.set_xticklabels(CLASS_NAMES, rotation=45, ha="right")
+    ax.set_yticks(np.arange(N_CLASSES)); ax.set_yticklabels(CLASS_NAMES)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title(prefix.replace("_", " ") + " confusion matrix")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    for i in range(N_CLASSES):
+        for j in range(N_CLASSES):
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(fig_dir / f"{prefix}_confusion_matrix_counts.png", dpi=220)
+    plt.close(fig)
+    return cm_df, pct
+
+if "y_test" in globals() and "test_probs_temp" in globals():
+    internal_cm_df, internal_pct_df = export_confusion_and_classwise(
+        y_test, test_probs_temp, "internal_test_temperature_scaled"
+    )
+    display(internal_pct_df)
+    display(internal_cm_df)
+else:
+    print("Internal test variables not found; run the main evaluation cells first.")
+
+if "y_ext" in globals() and "ext_probs" in globals():
+    isic_cm_df, isic_pct_df = export_confusion_and_classwise(
+        y_ext, ext_probs, "isic2018_task3_related_domain"
+    )
+    display(isic_pct_df)
+    display(isic_cm_df)
+else:
+    print("ISIC2018 variables not found; run external related-domain evaluation first if available.")
+
+# %% [cell 75]
+
+# --- Reviewer export 2: ECE bins, MCE, class-wise calibration, and calibration CIs ---
+
+def calibration_bin_table(y_true, probs, n_bins=15, prefix=""):
+    """Top-label calibration using maximum predicted probability and equal-width bins over [0, 1]."""
+    y_true = np.asarray(y_true)
+    probs = np.asarray(probs)
+    conf = probs.max(axis=1)
+    pred = probs.argmax(axis=1)
+    correct = (pred == y_true).astype(float)
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    rows = []
+    ece = 0.0
+    mce = 0.0
+    n = len(y_true)
+    for b in range(n_bins):
+        lo, hi = edges[b], edges[b + 1]
+        if b == n_bins - 1:
+            mask = (conf >= lo) & (conf <= hi)
+        else:
+            mask = (conf >= lo) & (conf < hi)
+        count = int(mask.sum())
+        if count:
+            acc = float(correct[mask].mean())
+            avg_conf = float(conf[mask].mean())
+            gap = abs(acc - avg_conf)
+        else:
+            acc = np.nan; avg_conf = np.nan; gap = 0.0
+        weight = count / max(n, 1)
+        ece += weight * gap
+        mce = max(mce, gap)
+        rows.append({
+            "prefix": prefix,
+            "bin": b,
+            "bin_low": lo,
+            "bin_high": hi,
+            "count": count,
+            "weight": weight,
+            "accuracy": acc,
+            "mean_confidence": avg_conf,
+            "abs_gap": gap,
+        })
+    return pd.DataFrame(rows), {"prefix": prefix, "ece": ece, "mce": mce, "n_bins": n_bins, "n": n}
+
+
+def classwise_one_vs_rest_calibration(y_true, probs, n_bins=15, prefix=""):
+    """One-vs-rest class-wise calibration; useful for identifying heterogeneous calibration."""
+    y_true = np.asarray(y_true)
+    probs = np.asarray(probs)
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    summary_rows = []
+    bin_rows = []
+    n = len(y_true)
+    for k, cls in enumerate(CLASS_NAMES):
+        y_bin = (y_true == k).astype(float)
+        p = probs[:, k]
+        ece = 0.0; mce = 0.0
+        for b in range(n_bins):
+            lo, hi = edges[b], edges[b + 1]
+            if b == n_bins - 1:
+                mask = (p >= lo) & (p <= hi)
+            else:
+                mask = (p >= lo) & (p < hi)
+            count = int(mask.sum())
+            if count:
+                emp = float(y_bin[mask].mean())
+                avg_p = float(p[mask].mean())
+                gap = abs(emp - avg_p)
+            else:
+                emp = np.nan; avg_p = np.nan; gap = 0.0
+            weight = count / max(n, 1)
+            ece += weight * gap
+            mce = max(mce, gap)
+            bin_rows.append({
+                "prefix": prefix,
+                "class": cls,
+                "bin": b,
+                "bin_low": lo,
+                "bin_high": hi,
+                "count": count,
+                "empirical_frequency": emp,
+                "mean_predicted_probability": avg_p,
+                "abs_gap": gap,
+            })
+        summary_rows.append({
+            "prefix": prefix,
+            "class": cls,
+            "support": int((y_true == k).sum()),
+            "classwise_ece": ece,
+            "classwise_mce": mce,
+            "n_bins": n_bins,
+        })
+    return pd.DataFrame(summary_rows), pd.DataFrame(bin_rows)
+
+
+def bootstrap_calibration_ci(y_true, probs, n_reps=1000, seed=42, prefix=""):
+    """Bootstrap CIs for global ECE/MCE and class-wise ECE/MCE."""
+    rng = np.random.default_rng(seed)
+    y_true = np.asarray(y_true)
+    probs = np.asarray(probs)
+    n = len(y_true)
+    global_rows = []
+    class_rows = []
+    for rep in range(int(n_reps)):
+        idx = rng.integers(0, n, size=n)
+        try:
+            _, g = calibration_bin_table(y_true[idx], probs[idx], CONFIG["n_bins_ece"], prefix=prefix)
+            g["rep"] = rep
+            global_rows.append(g)
+            cw, _ = classwise_one_vs_rest_calibration(y_true[idx], probs[idx], CONFIG["n_bins_ece"], prefix=prefix)
+            cw["rep"] = rep
+            class_rows.append(cw)
+        except Exception:
+            continue
+
+    global_boot = pd.DataFrame(global_rows)
+    class_boot = pd.concat(class_rows, ignore_index=True) if class_rows else pd.DataFrame()
+
+    global_summary = []
+    for metric in ["ece", "mce"]:
+        vals = global_boot[metric].dropna().values if metric in global_boot else np.array([])
+        if len(vals):
+            global_summary.append({
+                "prefix": prefix,
+                "metric": metric,
+                "mean_bootstrap": float(np.mean(vals)),
+                "lower_95": float(np.percentile(vals, 2.5)),
+                "upper_95": float(np.percentile(vals, 97.5)),
+                "bootstrap_reps_successful": int(len(vals)),
+            })
+
+    class_summary = []
+    if len(class_boot):
+        for cls, gcls in class_boot.groupby("class"):
+            for metric in ["classwise_ece", "classwise_mce"]:
+                vals = gcls[metric].dropna().values
+                if len(vals):
+                    class_summary.append({
+                        "prefix": prefix,
+                        "class": cls,
+                        "metric": metric,
+                        "mean_bootstrap": float(np.mean(vals)),
+                        "lower_95": float(np.percentile(vals, 2.5)),
+                        "upper_95": float(np.percentile(vals, 97.5)),
+                        "bootstrap_reps_successful": int(len(vals)),
+                    })
+
+    return pd.DataFrame(global_summary), pd.DataFrame(class_summary), global_boot, class_boot
+
+
+calibration_exports = []
+if "y_test" in globals() and "test_probs_raw" in globals():
+    raw_bins, raw_summary = calibration_bin_table(y_test, test_probs_raw, CONFIG["n_bins_ece"], "internal_raw")
+    raw_bins.to_csv(RESULT_DIR / "reviewer_internal_raw_calibration_bins.csv", index=False)
+    calibration_exports.append(raw_summary)
+if "y_test" in globals() and "test_probs_temp" in globals():
+    temp_bins, temp_summary = calibration_bin_table(y_test, test_probs_temp, CONFIG["n_bins_ece"], "internal_temperature_scaled")
+    temp_bins.to_csv(RESULT_DIR / "reviewer_internal_temperature_scaled_calibration_bins.csv", index=False)
+    calibration_exports.append(temp_summary)
+    cw_sum, cw_bins = classwise_one_vs_rest_calibration(y_test, test_probs_temp, CONFIG["n_bins_ece"], "internal_temperature_scaled")
+    cw_sum.to_csv(RESULT_DIR / "reviewer_internal_classwise_calibration_summary.csv", index=False)
+    cw_bins.to_csv(RESULT_DIR / "reviewer_internal_classwise_calibration_bins.csv", index=False)
+    display(cw_sum)
+
+    cal_ci_global, cal_ci_class, cal_boot_global, cal_boot_class = bootstrap_calibration_ci(
+        y_test,
+        test_probs_temp,
+        n_reps=CONFIG.get("calibration_bootstrap_reps", CONFIG.get("bootstrap_reps", 1000)),
+        seed=CONFIG["seed"],
+        prefix="internal_temperature_scaled",
+    )
+    cal_ci_global.to_csv(RESULT_DIR / "reviewer_internal_calibration_global_bootstrap_ci.csv", index=False)
+    cal_ci_class.to_csv(RESULT_DIR / "reviewer_internal_calibration_classwise_bootstrap_ci.csv", index=False)
+    cal_boot_global.to_csv(RESULT_DIR / "reviewer_internal_calibration_global_bootstrap_raw.csv", index=False)
+    cal_boot_class.to_csv(RESULT_DIR / "reviewer_internal_calibration_classwise_bootstrap_raw.csv", index=False)
+    display(cal_ci_global)
+if "y_ext" in globals() and "ext_probs" in globals():
+    ext_bins, ext_summary = calibration_bin_table(y_ext, ext_probs, CONFIG["n_bins_ece"], "isic2018_task3_related_domain")
+    ext_bins.to_csv(RESULT_DIR / "reviewer_isic2018_related_domain_calibration_bins.csv", index=False)
+    calibration_exports.append(ext_summary)
+    ext_cw_sum, ext_cw_bins = classwise_one_vs_rest_calibration(y_ext, ext_probs, CONFIG["n_bins_ece"], "isic2018_task3_related_domain")
+    ext_cw_sum.to_csv(RESULT_DIR / "reviewer_isic2018_related_domain_classwise_calibration_summary.csv", index=False)
+    ext_cw_bins.to_csv(RESULT_DIR / "reviewer_isic2018_related_domain_classwise_calibration_bins.csv", index=False)
+
+    ext_cal_ci_global, ext_cal_ci_class, ext_cal_boot_global, ext_cal_boot_class = bootstrap_calibration_ci(
+        y_ext,
+        ext_probs,
+        n_reps=CONFIG.get("calibration_bootstrap_reps", CONFIG.get("bootstrap_reps", 1000)),
+        seed=CONFIG["seed"] + 2018,
+        prefix="isic2018_task3_related_domain",
+    )
+    ext_cal_ci_global.to_csv(RESULT_DIR / "reviewer_isic2018_related_domain_calibration_global_bootstrap_ci.csv", index=False)
+    ext_cal_ci_class.to_csv(RESULT_DIR / "reviewer_isic2018_related_domain_calibration_classwise_bootstrap_ci.csv", index=False)
+    ext_cal_boot_global.to_csv(RESULT_DIR / "reviewer_isic2018_related_domain_calibration_global_bootstrap_raw.csv", index=False)
+    ext_cal_boot_class.to_csv(RESULT_DIR / "reviewer_isic2018_related_domain_calibration_classwise_bootstrap_raw.csv", index=False)
+    display(ext_cw_sum)
+
+if calibration_exports:
+    cal_summary_df = pd.DataFrame(calibration_exports)
+    cal_summary_df.to_csv(RESULT_DIR / "reviewer_global_ece_mce_summary.csv", index=False)
+    display(cal_summary_df)
+else:
+    print("No calibration variables found; run the main evaluation cells first.")
+
+# %% [cell 76]
+
+# --- Reviewer export 3: melanoma-specific selective referral counts ---
+
+def entropy_scores(probs):
+    p = np.clip(np.asarray(probs), 1e-12, 1.0)
+    return -np.sum(p * np.log(p), axis=1)
+
+
+def negative_margin_scores(probs):
+    p = np.asarray(probs)
+    top2 = np.sort(p, axis=1)[:, -2:]
+    return -(top2[:, 1] - top2[:, 0])
+
+
+def melanoma_referral_counts(y_true, probs, score_values, score_name, target_coverages=(0.95, 0.90, 0.80, 0.70, 0.50)):
+    y_true = np.asarray(y_true)
+    probs = np.asarray(probs)
+    pred = probs.argmax(axis=1)
+    mel_idx = CLASS_NAMES.index("mel")
+    order = np.argsort(score_values)  # lower uncertainty retained first
+    rows = []
+    n = len(y_true)
+    for cov in target_coverages:
+        k = int(round(cov * n))
+        k = max(1, min(n, k))
+        retained = np.zeros(n, dtype=bool)
+        retained[order[:k]] = True
+        uncertainty_threshold = float(np.asarray(score_values)[order[k - 1]])
+        mel_mask = (y_true == mel_idx)
+        mel_auto = mel_mask & retained
+        mel_referred = mel_mask & (~retained)
+        mel_correct = mel_auto & (pred == mel_idx)
+        mel_wrong = mel_auto & (pred != mel_idx)
+        auto_correct_all = retained & (pred == y_true)
+        rows.append({
+            "score": score_name,
+            "target_coverage": cov,
+            "uncertainty_threshold": uncertainty_threshold,
+            "threshold_direction": "auto-classify if score <= uncertainty_threshold",
+            "actual_coverage": retained.mean(),
+            "referral_rate": 1 - retained.mean(),
+            "n_total": n,
+            "n_auto_classified": int(retained.sum()),
+            "n_referred": int((~retained).sum()),
+            "selective_risk": 1 - float(auto_correct_all.sum() / max(retained.sum(), 1)),
+            "n_melanoma_total": int(mel_mask.sum()),
+            "n_melanoma_auto_total": int(mel_auto.sum()),
+            "n_melanoma_auto_correct": int(mel_correct.sum()),
+            "n_melanoma_auto_wrong": int(mel_wrong.sum()),
+            "n_melanoma_referred": int(mel_referred.sum()),
+            "melanoma_auto_recall": float(mel_correct.sum() / max(mel_mask.sum(), 1)),
+            "melanoma_coverage": float(mel_auto.sum() / max(mel_mask.sum(), 1)),
+        })
+    return pd.DataFrame(rows)
+
+if "y_test" in globals() and "test_probs_temp" in globals():
+    p = test_probs_temp
+    score_dict = {
+        "maxprob_uncertainty": 1 - p.max(axis=1),
+        "entropy": entropy_scores(p),
+        "negative_margin": negative_margin_scores(p),
+    }
+    mel_tables = []
+    for name, vals in score_dict.items():
+        mel_tables.append(melanoma_referral_counts(y_test, p, vals, name))
+    melanoma_referral_df = pd.concat(mel_tables, ignore_index=True)
+    melanoma_referral_df.to_csv(RESULT_DIR / "reviewer_melanoma_selective_referral_counts.csv", index=False)
+    display(melanoma_referral_df)
+else:
+    print("Internal test probabilities not found; run temperature-scaled evaluation first.")
+
+# %% [cell 77]
+
+# --- Reviewer export 4: exact and perceptual overlap checks between HAM10000 and ISIC2018 ---
+# Conservative cross-dataset leakage screen.
+# Reports image_id overlap, lesion_id overlap when genuine lesion IDs are available,
+# exact SHA256 file-hash overlap, and simple 64-bit dHash candidate near-duplicates.
+# dHash candidates are flags for manual review, not proof.
+import hashlib
+
+
+def sha256_file(path, block_size=1024 * 1024):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(block_size), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def dhash64(path, hash_size=8):
+    im = Image.open(path).convert("L").resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
+    arr = np.asarray(im)
+    diff = arr[:, 1:] > arr[:, :-1]
+    value = 0
+    for bit in diff.flatten():
+        value = (value << 1) | int(bit)
+    return int(value)
+
+
+def hamming64(a, b):
+    return int((int(a) ^ int(b)).bit_count())
+
+
+def prepare_overlap_paths(df, source_name):
+    out = df.copy()
+    if "lesion_id" not in out.columns:
+        out["lesion_id"] = np.nan
+    required = ["image_id", "lesion_id", "image_path"]
+    missing = [c for c in required if c not in out.columns]
+    if missing:
+        raise ValueError(f"{source_name} overlap dataframe is missing columns: {missing}")
+    out = out[required].copy()
+    out["image_id"] = out["image_id"].astype(str)
+    out["image_path"] = out["image_path"].astype(str)
+    out = out[out["image_path"].map(lambda p: bool(p) and Path(p).exists())].copy()
+    return out.reset_index(drop=True)
+
+
+ham_metadata_source = None
+if "metadata_df" in globals():
+    ham_metadata_source = metadata_df
+elif "meta" in globals():
+    ham_metadata_source = meta
+
+if "external_isic2018_df" in globals() and external_isic2018_df is not None and ham_metadata_source is not None:
+    ham_df_overlap = ham_metadata_source.copy()
+    ext_df_overlap = external_isic2018_df.copy()
+
+    ham_image_ids = set(ham_df_overlap["image_id"].astype(str))
+    ext_image_ids = set(ext_df_overlap["image_id"].astype(str))
+    id_overlap = sorted(ham_image_ids & ext_image_ids)
+
+    lesion_id_source = getattr(external_isic2018_df, "attrs", {}).get("lesion_id_source", "unknown")
+    ext_has_true_lesion_ids = (
+        "lesion_id" in ext_df_overlap.columns
+        and ext_df_overlap["lesion_id"].notna().any()
+        and lesion_id_source != "not_available_in_groundtruth"
+    )
+    ham_has_lesion_ids = "lesion_id" in ham_df_overlap.columns and ham_df_overlap["lesion_id"].notna().any()
+    lesion_overlap_assessable = bool(ham_has_lesion_ids and ext_has_true_lesion_ids)
+
+    lesion_overlap = []
+    if lesion_overlap_assessable:
+        ham_lesion_ids = set(ham_df_overlap["lesion_id"].dropna().astype(str))
+        ext_lesion_ids = set(ext_df_overlap["lesion_id"].dropna().astype(str))
+        lesion_overlap = sorted(ham_lesion_ids & ext_lesion_ids)
+
+    ham_paths = prepare_overlap_paths(ham_df_overlap, "HAM10000")
+    ext_paths = prepare_overlap_paths(ext_df_overlap, "ISIC2018")
+
+    ham_paths["sha256"] = [sha256_file(p) for p in ham_paths["image_path"]]
+    ext_paths["sha256"] = [sha256_file(p) for p in ext_paths["image_path"]]
+    exact_overlap = ham_paths.merge(ext_paths, on="sha256", suffixes=("_ham", "_isic"))
+
+    # Simple dHash screen. Threshold <= CONFIG['near_duplicate_dhash_threshold'] is a candidate flag.
+    dhash_threshold = int(CONFIG.get("near_duplicate_dhash_threshold", 5))
+    ham_paths["dhash64"] = [dhash64(p) for p in ham_paths["image_path"]]
+    ext_paths["dhash64"] = [dhash64(p) for p in ext_paths["image_path"]]
+    ham_hashes = ham_paths[["image_id", "lesion_id", "image_path", "dhash64"]].to_dict("records")
+    candidates = []
+    for _, erow in ext_paths.iterrows():
+        best = None
+        for hrow in ham_hashes:
+            dist = hamming64(erow["dhash64"], hrow["dhash64"])
+            if best is None or dist < best["dhash_distance"]:
+                best = {
+                    "isic_image_id": erow["image_id"],
+                    "isic_lesion_id": erow.get("lesion_id", ""),
+                    "isic_image_path": erow["image_path"],
+                    "ham_image_id": hrow["image_id"],
+                    "ham_lesion_id": hrow.get("lesion_id", ""),
+                    "ham_image_path": hrow["image_path"],
+                    "dhash_distance": dist,
+                }
+        if best is not None and best["dhash_distance"] <= dhash_threshold:
+            candidates.append(best)
+
+    pd.DataFrame({"overlap_image_id": id_overlap}).to_csv(RESULT_DIR / "reviewer_cross_dataset_image_id_overlap.csv", index=False)
+    pd.DataFrame({"overlap_lesion_id": lesion_overlap}).to_csv(RESULT_DIR / "reviewer_cross_dataset_lesion_id_overlap.csv", index=False)
+    exact_overlap.to_csv(RESULT_DIR / "reviewer_cross_dataset_exact_sha256_overlap.csv", index=False)
+    pd.DataFrame(candidates).to_csv(RESULT_DIR / f"reviewer_cross_dataset_candidate_near_duplicates_dhash_le{dhash_threshold}.csv", index=False)
+
+    duplicate_summary = pd.DataFrame([{
+        "checks_completed": True,
+        "ham_n_images_hashed": int(len(ham_paths)),
+        "isic2018_n_images_hashed": int(len(ext_paths)),
+        "image_id_overlap_checked": True,
+        "image_id_overlap_n": int(len(id_overlap)),
+        "lesion_id_overlap_assessable": bool(lesion_overlap_assessable),
+        "isic2018_lesion_id_source": lesion_id_source,
+        "lesion_id_overlap_n": int(len(lesion_overlap)) if lesion_overlap_assessable else np.nan,
+        "lesion_id_overlap_note": "Official/test ground truth must provide lesion_id for this to be a true lesion-level check; otherwise not assessable.",
+        "exact_sha256_overlap_checked": True,
+        "exact_sha256_overlap_n": int(len(exact_overlap)),
+        "candidate_near_duplicate_screen": "64-bit dHash nearest HAM10000 image per ISIC2018 image",
+        "candidate_near_duplicate_dhash_threshold": dhash_threshold,
+        "candidate_near_duplicate_dhash_n": int(len(candidates)),
+        "interpretation": "Candidate near-duplicates require manual visual review; this screen is not definitive proof of identity.",
+    }])
+    duplicate_summary.to_csv(RESULT_DIR / "reviewer_cross_dataset_overlap_summary.csv", index=False)
+    display(duplicate_summary)
+    if len(candidates):
+        display(pd.DataFrame(candidates).head(20))
+else:
+    reason = []
+    if not ("external_isic2018_df" in globals() and external_isic2018_df is not None):
+        reason.append("ISIC2018 related-domain dataframe not available")
+    if ham_metadata_source is None:
+        reason.append("HAM10000 metadata dataframe not available")
+    duplicate_summary = pd.DataFrame([{
+        "checks_completed": False,
+        "reason": "; ".join(reason) if reason else "unknown",
+        "image_id_overlap_checked": False,
+        "lesion_id_overlap_assessable": False,
+        "exact_sha256_overlap_checked": False,
+        "candidate_near_duplicate_screen": "not_run",
+        "next_action": "Run the ISIC2018 builder/evaluation after downloading the official Task 3 test input and ground truth.",
+    }])
+    duplicate_summary.to_csv(RESULT_DIR / "reviewer_cross_dataset_overlap_summary.csv", index=False)
+    display(duplicate_summary)
+
+# %% [cell 78]
+
+# --- Reviewer export 5: TFLite numerical equivalence, latency, memory, and post-quantization performance ---
+# Run after TFLite export. This does not replace target-device validation.
+import time
+import resource
+
+
+def find_latest_tflite_model():
+    candidates = sorted(MODEL_DIR.glob("**/*.tflite"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else None
+
+
+def get_rss_mb():
+    """Best-effort current process RSS in MB."""
+    try:
+        import psutil
+        return psutil.Process(os.getpid()).memory_info().rss / 1e6
+    except Exception:
+        # ru_maxrss is kilobytes on Linux, bytes on macOS. Colab/Linux path is expected.
+        val = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return val / 1024.0
+
+
+def estimate_tflite_tensor_memory_mb(tflite_path, sample_shape):
+    """Approximate allocated tensor bytes after resizing input to sample_shape."""
+    interpreter = tf.lite.Interpreter(model_path=str(tflite_path))
+    input_details = interpreter.get_input_details()
+    input_idx = input_details[0]["index"]
+    interpreter.resize_tensor_input(input_idx, sample_shape, strict=False)
+    interpreter.allocate_tensors()
+    total_bytes = 0
+    for t in interpreter.get_tensor_details():
+        shape = t.get("shape", [])
+        if shape is None or len(shape) == 0 or np.any(np.asarray(shape) < 0):
+            continue
+        try:
+            dtype = np.dtype(t.get("dtype", np.float32))
+            total_bytes += int(np.prod(shape)) * dtype.itemsize
+        except Exception:
+            continue
+    return total_bytes / 1e6
+
+
+def tflite_predict_images(tflite_path, image_batch):
+    rss_before = get_rss_mb()
+    interpreter = tf.lite.Interpreter(model_path=str(tflite_path))
+    interpreter.allocate_tensors()
+    rss_after_allocate = get_rss_mb()
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    input_idx = input_details[0]["index"]
+    output_idx = output_details[0]["index"]
+    preds = []
+    times = []
+    for x in image_batch:
+        x_in = np.expand_dims(x.astype(np.float32), axis=0)
+        # Resize dynamic input if required.
+        if tuple(input_details[0]["shape"]) != tuple(x_in.shape):
+            interpreter.resize_tensor_input(input_idx, x_in.shape, strict=False)
+            interpreter.allocate_tensors()
+            input_details = interpreter.get_input_details()
+            output_details = interpreter.get_output_details()
+            input_idx = input_details[0]["index"]
+            output_idx = output_details[0]["index"]
+        t0 = time.perf_counter()
+        interpreter.set_tensor(input_idx, x_in)
+        interpreter.invoke()
+        y = interpreter.get_tensor(output_idx)
+        times.append(time.perf_counter() - t0)
+        preds.append(y[0])
+    return np.asarray(preds), np.asarray(times), {
+        "rss_mb_before_interpreter": rss_before,
+        "rss_mb_after_allocate": rss_after_allocate,
+        "rss_mb_delta_allocate": rss_after_allocate - rss_before,
+    }
+
+
+if "model_eval" in globals() and ("test_df_eval" in globals() or "test_df" in globals()):
+    tflite_path = find_latest_tflite_model()
+    if tflite_path is None:
+        print("No .tflite model found under MODEL_DIR. Run TFLite export first.")
+    elif model_uses_metadata(model_eval):
+        print("Selected model uses metadata; image-only TFLite wrapper does not apply. Implement a two-input TFLite export before profiling.")
+    else:
+        df_for_tflite = test_df_eval if "test_df_eval" in globals() else test_df
+        perf_limit = CONFIG.get("tflite_performance_max_n", None)
+        n_perf = len(df_for_tflite) if perf_limit is None else min(int(perf_limit), len(df_for_tflite))
+        n_profile = min(int(CONFIG.get("tflite_profile_max_n", 200)), n_perf)
+
+        perf_df = df_for_tflite.iloc[:n_perf].copy()
+        profile_df = df_for_tflite.iloc[:n_profile].copy()
+
+        # Load raw image arrays using the notebook loader.
+        image_batch_perf = np.stack([load_image_numpy(p) for p in perf_df["image_path"]], axis=0)
+        image_batch_profile = image_batch_perf[:n_profile]
+        y_perf = perf_df["label"].astype(int).to_numpy()
+
+        keras_logits_perf = model_eval.predict({"image": image_batch_perf}, batch_size=CONFIG["batch_size"], verbose=0)
+        tflite_logits_perf, per_image_times, memory_profile = tflite_predict_images(tflite_path, image_batch_perf)
+
+        keras_probs_perf = softmax_np(keras_logits_perf, temperature=T if "T" in globals() else 1.0)
+        tflite_probs_perf = softmax_np(tflite_logits_perf, temperature=T if "T" in globals() else 1.0)
+
+        max_abs_logit_diff = float(np.max(np.abs(keras_logits_perf - tflite_logits_perf)))
+        mean_abs_logit_diff = float(np.mean(np.abs(keras_logits_perf - tflite_logits_perf)))
+        max_abs_prob_diff = float(np.max(np.abs(keras_probs_perf - tflite_probs_perf)))
+        mean_abs_prob_diff = float(np.mean(np.abs(keras_probs_perf - tflite_probs_perf)))
+        top1_agreement = float((keras_probs_perf.argmax(axis=1) == tflite_probs_perf.argmax(axis=1)).mean())
+
+        keras_metrics = evaluate_probs(y_perf, keras_probs_perf, prefix="keras_profile_")
+        tflite_metrics = evaluate_probs(y_perf, tflite_probs_perf, prefix="tflite_postquant_")
+
+        tensor_memory_mb = estimate_tflite_tensor_memory_mb(tflite_path, tuple(np.expand_dims(image_batch_profile[0], axis=0).shape))
+
+        profile = pd.DataFrame([{
+            "tflite_path": str(tflite_path),
+            "n_performance_evaluated": int(n_perf),
+            "n_latency_profiled": int(n_profile),
+            "artifact_size_mb": tflite_path.stat().st_size / 1e6,
+            "estimated_tflite_tensor_memory_mb": tensor_memory_mb,
+            **memory_profile,
+            "max_abs_logit_diff_vs_keras": max_abs_logit_diff,
+            "mean_abs_logit_diff_vs_keras": mean_abs_logit_diff,
+            "max_abs_probability_diff_vs_keras": max_abs_prob_diff,
+            "mean_abs_probability_diff_vs_keras": mean_abs_prob_diff,
+            "top1_agreement_vs_keras": top1_agreement,
+            "latency_ms_mean_cpu": float(per_image_times[:n_profile].mean() * 1000),
+            "latency_ms_median_cpu": float(np.median(per_image_times[:n_profile]) * 1000),
+            "latency_ms_p95_cpu": float(np.percentile(per_image_times[:n_profile], 95) * 1000),
+            "deployment_feasibility_claim": "not established by this notebook; target-device profiling, clinical workflow testing, and equivalence review are still required",
+        }])
+
+        perf_table = pd.DataFrame([{**keras_metrics, **tflite_metrics}])
+        profile.to_csv(RESULT_DIR / "reviewer_tflite_equivalence_latency_memory_profile.csv", index=False)
+        perf_table.to_csv(RESULT_DIR / "reviewer_tflite_postquantization_performance.csv", index=False)
+        # Backward-compatible name for older result manifest references.
+        profile.to_csv(RESULT_DIR / "reviewer_tflite_equivalence_latency_profile.csv", index=False)
+        display(profile)
+        display(perf_table.T.rename(columns={0: "value"}))
+else:
+    print("Model or test data not found; run the main evaluation and TFLite export first.")
+
+# %% [cell 79]
+# --- Final reviewer/editor compliance matrix ---
+# Run this after the full notebook completes. It records which reviewer-requested
+# artifacts exist and flags the manual DOI repository step that cannot be completed inside Colab.
+
+if CONFIG.get("generate_reviewer_compliance_matrix", True):
+    def exists_any(patterns):
+        for pat in patterns:
+            if list(RESULT_DIR.glob(pat)) or list(SPLIT_DIR.glob(pat)) or list(MODEL_DIR.glob(pat)) or list(FIG_DIR.glob(pat)):
+                return True
+        return False
+
+    compliance_items = [
+        {
+            "editor_or_reviewer_point": "Revised concise non-question title without punctuation",
+            "notebook_artifact_or_action": "Notebook title and revision notes use 'Calibrated Selective Referral for Skin Lesion AI on HAM10000'",
+            "status_after_full_run": "addressed_in_notebook_text",
+            "remaining_manual_action": "Ensure identical title in manuscript file, tracking system, cover letter, and response letter.",
+        },
+        {
+            "editor_or_reviewer_point": "Full lesion-level split protocol and class distributions",
+            "notebook_artifact_or_action": "reviewer_split_protocol_summary.json; reviewer_split_class_distribution.csv; reviewer_split_internal_overlap_checks.csv",
+            "status_after_full_run": "present" if exists_any(["reviewer_split_protocol_summary.json", "reviewer_split_class_distribution.csv"]) else "missing_until_split_cell_runs",
+            "remaining_manual_action": "Copy exact counts/seeds/method from generated files into Methods.",
+        },
+        {
+            "editor_or_reviewer_point": "Complete training reproducibility details",
+            "notebook_artifact_or_action": "reviewer_training_reproducibility_details.json; reviewer_class_weight_values.csv; model runtime/history files; fine_tuned_layers_after_unfreeze.json",
+            "status_after_full_run": "present" if exists_any(["reviewer_training_reproducibility_details.json", "reviewer_class_weight_values.csv"]) else "missing_until_training_detail_cell_runs",
+            "remaining_manual_action": "Deposit notebook/scripts, splits, histories, and result tables in DOI repository.",
+        },
+        {
+            "editor_or_reviewer_point": "ECE binning, MCE, class-wise calibration, and calibration CIs",
+            "notebook_artifact_or_action": "reviewer_temperature_scaling_and_ece_definition.json; reviewer_global_ece_mce_summary.csv; reviewer_internal_*calibration*.csv",
+            "status_after_full_run": "present" if exists_any(["reviewer_global_ece_mce_summary.csv", "reviewer_internal_calibration_global_bootstrap_ci.csv"]) else "missing_until_calibration_export_runs",
+            "remaining_manual_action": "Report bin count, bin definition, and no-universal-ECE-threshold caveat in manuscript.",
+        },
+        {
+            "editor_or_reviewer_point": "Practical selective-referral operating point and worked example",
+            "notebook_artifact_or_action": "selective_referral_threshold_policy.json; selective_referral_worked_example.md; operating-point CSVs",
+            "status_after_full_run": "present" if exists_any(["selective_referral_threshold_policy.json", "selective_referral_worked_example.md"]) else "missing_until_operating_point_cell_runs",
+            "remaining_manual_action": "Use the validation-chosen threshold as an example, not a deployment recommendation.",
+        },
+        {
+            "editor_or_reviewer_point": "Melanoma-specific precision/recall/F1, confusion matrices, and referral counts",
+            "notebook_artifact_or_action": "internal_test_temperature_scaled_per_class_precision_recall_f1.csv; confusion matrices; reviewer_melanoma_selective_referral_counts.csv",
+            "status_after_full_run": "present" if exists_any(["internal_test_temperature_scaled_per_class_precision_recall_f1.csv", "reviewer_melanoma_selective_referral_counts.csv"]) else "missing_until_reviewer_metric_exports_run",
+            "remaining_manual_action": "Discuss low melanoma precision cautiously and avoid autonomous-diagnosis claims.",
+        },
+        {
+            "editor_or_reviewer_point": "Late-fusion metadata ablation and MC Dropout reported or removed",
+            "notebook_artifact_or_action": "multimodal_cleanmeta_test_metrics_temperature_scaled.csv; mc_dropout_metrics.csv; mc_dropout_selective_summary.csv",
+            "status_after_full_run": "present" if exists_any(["multimodal_cleanmeta_test_metrics_temperature_scaled.csv", "mc_dropout_metrics.csv"]) else "missing_until_optional_ablation_cells_run",
+            "remaining_manual_action": "If skipped in final run, remove these analyses from Methods or label as not performed.",
+        },
+        {
+            "editor_or_reviewer_point": "ISIC2018 subset, label mapping, and cross-dataset overlap checks",
+            "notebook_artifact_or_action": "isic2018_related_domain_subset_manifest.json/status.json; reviewer_cross_dataset_overlap_summary.csv",
+            "status_after_full_run": "present_or_status_written" if exists_any(["isic2018_related_domain_subset_manifest.json", "isic2018_related_domain_status.json", "reviewer_cross_dataset_overlap_summary.csv"]) else "missing_until_isic_cells_run",
+            "remaining_manual_action": "Download official ISIC2018 Task 3 test files if retaining related-domain robustness analysis.",
+        },
+        {
+            "editor_or_reviewer_point": "Subgroup sizes, class distributions, melanoma counts, and uncertainty intervals",
+            "notebook_artifact_or_action": "internal_subgroup_class_counts.csv; subgroup_bootstrap_ci_temperature_scaled.csv; subgroup_sex_calibration_discrimination_note.md",
+            "status_after_full_run": "present" if exists_any(["internal_subgroup_class_counts.csv", "subgroup_bootstrap_ci_temperature_scaled.csv"]) else "missing_until_subgroup_bootstrap_runs",
+            "remaining_manual_action": "State subgroup analyses are descriptive and underpowered for causal fairness claims.",
+        },
+        {
+            "editor_or_reviewer_point": "Complete stress-test metric table",
+            "notebook_artifact_or_action": "stress_test_metrics.csv",
+            "status_after_full_run": "present" if exists_any(["stress_test_metrics.csv"]) else "missing_until_stress_test_cell_runs",
+            "remaining_manual_action": "Tone down clinic-readiness claims if stress-test drops are substantial.",
+        },
+        {
+            "editor_or_reviewer_point": "TFLite numerical equivalence, latency, memory, and post-quantization performance",
+            "notebook_artifact_or_action": "reviewer_tflite_equivalence_latency_memory_profile.csv; reviewer_tflite_postquantization_performance.csv",
+            "status_after_full_run": "present" if exists_any(["reviewer_tflite_equivalence_latency_memory_profile.csv", "reviewer_tflite_postquantization_performance.csv"]) else "missing_until_tflite_reviewer_export_runs_or_not_applicable_for_metadata_model",
+            "remaining_manual_action": "Do not claim deployment feasibility without target-device/workflow/prospective validation.",
+        },
+        {
+            "editor_or_reviewer_point": "Code availability in recognised DOI-assigning repository",
+            "notebook_artifact_or_action": "reviewer_manuscript_revision_notes.md includes template; manifest files list outputs",
+            "status_after_full_run": "manual_external_step_required",
+            "remaining_manual_action": "Upload code, split files, result tables, figures, config, and environment logs to Zenodo/OSF/Figshare and insert DOI.",
+        },
+    ]
+
+    compliance_df = pd.DataFrame(compliance_items)
+    compliance_df.to_csv(RESULT_DIR / "reviewer_editor_compliance_matrix.csv", index=False)
+    display(compliance_df)
+
+    remaining = [r for r in compliance_items if "required" in r["status_after_full_run"] or "missing" in r["status_after_full_run"]]
+    remaining_lines = ["# Remaining reviewer/editor actions", ""]
+    for r in compliance_items:
+        remaining_lines.append(f"- **{r['editor_or_reviewer_point']}**: {r['status_after_full_run']}. {r['remaining_manual_action']}")
+    (RESULT_DIR / "reviewer_editor_remaining_actions.md").write_text("\n".join(remaining_lines))
+    print("Saved:", RESULT_DIR / "reviewer_editor_compliance_matrix.csv")
+    print("Saved:", RESULT_DIR / "reviewer_editor_remaining_actions.md")
+else:
+    print("Reviewer/editor compliance matrix disabled by CONFIG.")

@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: If you use this repository, please cite it using the metadata below.
+title: Calibrated Selective Referral for Skin Lesion AI on HAM10000
+authors:
+  - family-names: Yu
+    given-names: Tianyi
+repository-code: https://github.com/terry0809000/ham10000-trustworthy-skin-ai
+license: MIT
+version: 0.1.0
+date-released: 2026-07-07
+keywords:
+  - HAM10000
+  - skin lesion classification
+  - calibration
+  - selective referral
+  - uncertainty
+  - clinical decision support
