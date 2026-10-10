@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/project-cover.png" width="100%" alt="Conceptual scientific artwork for Skin lesion AI" /></p>
+
 # Calibrated Selective Referral for Skin Lesion AI on HAM10000
 
 A leakage-controlled, calibrated, selective-referral evaluation workflow for HAM10000 skin-lesion AI.
