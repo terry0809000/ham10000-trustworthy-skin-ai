@@ -39,7 +39,7 @@ tests/                   Lightweight unit tests
 ## Quick start
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/terry0809000/ham10000-trustworthy-skin-ai.git
 cd ham10000-trustworthy-skin-ai
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
